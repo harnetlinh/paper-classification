@@ -1,0 +1,299 @@
+"""
+Prompt templates và codebook v2.1 cho LLM panel.
+
+CRITICAL: System prompt có explicit instruction để LLM:
+- Ưu tiên Abstract (190 words) over Title (14 words)
+- Cite specific text TỪ ABSTRACT khi justify label
+- Apply 20% threshold rule
+- Output strict JSON schema
+"""
+
+CODEBOOK_V2_1 = """
+# CODEBOOK v2.1 — Educational Research Bibliometric Classification
+
+## OVERALL RULES
+
+1. **Abstract is PRIMARY signal** (~190 words, detailed). Title is SECONDARY (~14 words).
+   Base classification PRIMARILY on Abstract content. Use Title only for disambiguation.
+
+2. **20% threshold rule**: Assign a label if the topic contributes ≥20% of paper content
+   (≥2 sentences in abstract OR mentioned in title + ≥1 abstract sentence).
+
+3. **Multi-label allowed for Fields**: A paper can have 1-6 labels. No primary requirement.
+
+4. **STEM/Non-STEM**: Default mutually exclusive. Allow BOTH only for comparative or
+   integration studies (e.g., "comparing STEM vs Non-STEM students").
+
+5. **Reasoning REQUIRED**: For each TRUE label, cite specific text from ABSTRACT
+   (not Title) in the reasoning field.
+
+## 12 FIELDS
+
+### 1. teaching & learning (UMBRELLA — broad inclusion)
+Definition: ANY paper with classroom-level dạy/học component.
+Inclusion: Teaching methods, learning processes, learner engagement, learning outcomes.
+Exclusion: Pure policy/admin without classroom-level activities; bibliometrics.
+Boundary: Disambiguation:
+  - vs Curriculum: T&L = HOW (delivery), Curriculum = WHAT (content design)
+  - vs Test and assessment: T&L includes formative assessment; T&A is PRIMARILY about measurement design
+  - vs M&L&P: T&L = classroom level, M&L&P = institutional level
+
+### 2. management, leadership & policy
+Definition: Institutional/system-level management, leadership, governance, policy.
+Inclusion: School/university management, principals, deans, education policy, QA, accreditation.
+Exclusion: Pure classroom-level (→ T&L); curriculum content design (→ Curriculum).
+
+### 3. test and assessment
+Definition: PRIMARILY about measurement methodology — test/scale design, validation, psychometrics.
+Inclusion: Psychometric validation, IRT/Rasch, rubrics design, assessment methodology.
+Exclusion: Papers using outcome data without bandling assessment design itself.
+
+### 4. Technology in education
+Definition: Digital tools as MEANS for teaching/learning/admin.
+Inclusion: LMS, MOOCs, AI tutoring, VR/AR, learning analytics, EdTech apps.
+Exclusion: Teaching the SUBJECT of computer science (→ STEM).
+Boundary: Tech in edu = tech is the MEANS. STEM = tech/CS is the SUBJECT.
+
+### 5. English Education
+Definition: Teaching/learning English as language (ESL/EFL/EMI/EAP/ESP/CLIL).
+Inclusion: TESOL, English-medium instruction, English language testing.
+Exclusion: English literature criticism without teaching focus.
+
+### 6. curriculum
+Definition: Curriculum design — content/learning outcomes/educational activities planned.
+Inclusion: Program design, syllabus, curriculum reform, CBE/OBE.
+Exclusion: Specific module teaching (→ T&L); admin of programs (→ M&L&P).
+
+### 7. psychology in education (BROAD definition)
+Definition: Psychological/emotional aspects in educational contexts.
+Inclusion:
+  - Student wellbeing, mental health, academic anxiety
+  - Motivation, engagement, self-efficacy in learning contexts
+  - Social-emotional learning (SEL), emotional intelligence
+  - Psychological assessment for students/teachers
+  - Stress, burnout, emotional support
+Exclusion: Pure clinical psychology without educational context.
+Note: This class is BROAD per project decision — covers psych aspects, not only "teaching of psychology subject".
+
+### 8. Special education
+Definition: Education for exceptional learners — disabilities AND gifted.
+Inclusion:
+  - Students with disabilities (autism, ADHD, dyslexia, ID, sensory)
+  - Gifted/talented education
+  - Inclusive education, mainstreaming
+  - IEP, accommodations
+Exclusion: General at-risk (low SES, first-gen) without disability/gifted focus.
+
+### 9. International education
+Definition: Cross-border, comparative, transnational education.
+Inclusion: International students, study abroad, comparative education across countries,
+internationalization of HE, IB/Cambridge/AP curricula.
+Exclusion: Single-country studies even if Vietnam-focused (must have cross-border element).
+
+### 10. Education economically
+Definition: Education from economic perspective — ROE, labor outcomes, costs, equity.
+Inclusion: Wage premium, education funding, employability, human capital,
+education and economic development, education and inequality.
+Exclusion: Teaching economics as a subject (→ Curriculum + Non-STEM).
+
+### 11. STEM education
+Definition: Teaching/learning in Science/Technology/Engineering/Mathematics.
+Inclusion: Math, physics, chemistry, biology, engineering, CS education;
+integrated STEM, STEM equity.
+Boundary: STEM/Non-STEM exclusive default. Allow BOTH for comparative or integration.
+
+### 12. Non-STEM Education
+Definition: Education in arts, humanities, social sciences (non-STEM domains).
+Inclusion: History, philosophy, social sciences, arts, music, business education,
+humanities curriculum.
+
+## 6 EDUCATIONAL LEVELS
+
+- **ECE**: Early Childhood Education (0-6 years, preschool, kindergarten)
+- **GE**: General Education (K-12, primary + secondary)
+- **HE**: Higher Education (undergraduate, graduate, university)
+- **TVET**: Technical and Vocational Education (vocational training, technical schools)
+- **LLL**: Lifelong Learning (adult education, continuing education, professional development)
+- **ALL**: All levels (paper covers 3+ levels OR teacher training that targets all levels)
+
+Rules:
+- Multi-label allowed
+- If paper is about teacher PD, gắn LLL (training adults), NOT the level taught
+- If paper covers 3+ levels, use ALL instead of listing each
+- Default fallback when level unclear: ALL
+
+## 5 METHODS (single-label)
+
+- **Quantitative**: Statistical tests, regression, surveys with N=, ANOVA, SEM
+- **Qualitative**: Interviews, focus groups, ethnography, thematic analysis, case study (no stats)
+- **Mixed**: Both quantitative AND qualitative data systematically combined
+- **Review**: Systematic/scoping review, meta-analysis, bibliometric (no primary data)
+- **Other**: Conceptual papers, theoretical models, position papers, design studies
+"""
+
+
+SYSTEM_PROMPT_SPECIAL_EDU = """You are an expert reviewer screening educational research papers for "Special Education" candidacy.
+
+## CRITICAL INSTRUCTIONS
+1. The Abstract is the PRIMARY source of information (~190 words, detailed). The Title is SECONDARY (~14 words).
+2. Base your decision PRIMARILY on Abstract content. Use Title only for disambiguation.
+3. In your reasoning, cite specific text from the Abstract that justifies your decision.
+
+## Special Education includes:
+- Students with disabilities (autism, ADHD, dyslexia, intellectual disability, sensory impairments)
+- Gifted/talented education
+- Inclusive education, mainstreaming students with special needs
+- Individualized Education Programs (IEP), accommodations
+- Wheelchair, mobility impairments, deaf/blind students
+- Speech-language pathology in education
+
+## NOT Special Education:
+- General at-risk students (low SES, first-gen) WITHOUT disability/gifted focus
+- General mental health for typical student population (that is "psychology in education")
+- Adult learners without disability focus
+- General medical/health education without disability focus
+- Diversity/equity discussions without disability focus
+
+## OUTPUT SCHEMA (strict JSON, no prose outside JSON)
+
+{
+  "is_special_education": true | false,
+  "reasoning": "<20+ words, cite text from Abstract>",
+  "confidence": "high" | "medium" | "low"
+}
+"""
+
+
+def make_special_edu_filter_prompt(title: str, abstract: str) -> tuple:
+    """
+    Build (system, user) prompts for Special Education candidate verification.
+
+    Returns:
+        (system_prompt, user_prompt)
+    """
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+
+    user = f"""## TITLE
+{title}
+
+## ABSTRACT
+{abstract if abstract else "[MISSING ABSTRACT — decision based on Title only, lower confidence]"}
+
+Is this paper about Special Education per the criteria? Output JSON only."""
+
+    return SYSTEM_PROMPT_SPECIAL_EDU, user
+
+
+# ==================== Educational-Level filter prompts ====================
+# Used to augment the rare Levels labels (ECE, TVET, LLL). Each level gets a
+# definition block with explicit include/exclude lists derived from the
+# codebook v2.1, plus boundary disambiguation against overlapping levels.
+
+LEVEL_AUGMENT_DEFINITIONS = {
+    "ECE": {
+        "name": "Early Childhood Education",
+        "description": "Education of children aged 0-6 years (pre-primary).",
+        "include": [
+            "Studies on children before primary school (under 6 years old)",
+            "Preschool, kindergarten, daycare, nursery — curriculum, teachers, learners, or program design",
+            "Early childhood development, early intervention programs for young children",
+            "Pre-primary education or pre-K programs",
+        ],
+        "exclude": [
+            "Primary school (Grades 1-5 / K-5) — that is General Education (GE), NOT ECE",
+            "Elementary school teachers — also GE, NOT ECE",
+            "Higher Education (university) — that is HE, NOT ECE",
+            "Studies on parents or family without a focus on the child's educational program",
+        ],
+    },
+    "TVET": {
+        "name": "Technical and Vocational Education and Training",
+        "description": "Vocational schools, apprenticeships, trade training (non-degree).",
+        "include": [
+            "Vocational secondary or post-secondary schools",
+            "Apprenticeships, on-the-job training, work-based learning programs",
+            "Trade-specific training (welding, plumbing, hairdressing, mechanics, hospitality, etc.)",
+            "Industry-specific certification courses (non-degree)",
+            "Polytechnic institutions explicitly focused on vocational/technical training",
+        ],
+        "exclude": [
+            "General universities (those are HE), even technical universities focused on degrees",
+            "K-12 academic programs without an explicit vocational track",
+            "Engineering / IT bachelor degrees at research universities — that is HE, NOT TVET",
+            "Pure soft-skills training without a vocational/trade focus",
+        ],
+    },
+    "LLL": {
+        "name": "Lifelong Learning",
+        "description": "Adult education, continuing professional development, learning across the lifespan.",
+        "include": [
+            "Adult learners returning to study after a break",
+            "Continuing professional development (CPD) courses for working adults",
+            "In-service teacher training (teachers as adult learners)",
+            "Workplace learning, on-the-job training for working adults",
+            "Continuing education courses for retirees or working adults",
+            "Andragogy (adult learning theory)",
+        ],
+        "exclude": [
+            "Pre-service teacher education during initial bachelor degree — that is HE, NOT LLL",
+            "K-12 student education even if researched by adult investigators",
+            "Higher Education for degree-seeking 18-22 year-olds — that is HE",
+            "TVET — papers focused on vocational/trade training, not on continuing learning",
+        ],
+    },
+}
+
+
+def make_level_filter_prompt(level_code: str, title: str, abstract: str) -> tuple:
+    """Build (system, user) prompts for a Level candidate verification.
+
+    Mirrors the structure of make_special_edu_filter_prompt but parameterized
+    by level definition. The response field name is "is_match" (caller must
+    coerce_bool that key — `make_special_edu_filter_prompt` uses
+    "is_special_education" for backward-compatible cache keys).
+    """
+    if level_code not in LEVEL_AUGMENT_DEFINITIONS:
+        raise ValueError(f"Unknown level: {level_code!r}")
+    d = LEVEL_AUGMENT_DEFINITIONS[level_code]
+
+    include_block = "\n".join(f"- {item}" for item in d["include"])
+    exclude_block = "\n".join(f"- {item}" for item in d["exclude"])
+
+    system = f"""You are an expert reviewer screening educational research papers for "{level_code}" ({d['name']}) candidacy.
+
+## CRITICAL INSTRUCTIONS
+1. The Abstract is the PRIMARY source of information (~190 words, detailed). The Title is SECONDARY (~14 words).
+2. Base your decision PRIMARILY on Abstract content. Use Title only for disambiguation.
+3. In your reasoning, cite specific text from the Abstract that justifies your decision.
+4. Be CONSERVATIVE — only return true if the paper's primary educational level genuinely matches "{level_code}". When in doubt, return false.
+
+## {level_code} ({d['name']}) — definition
+{d['description']}
+
+## {level_code} INCLUDES:
+{include_block}
+
+## NOT {level_code}:
+{exclude_block}
+
+## OUTPUT SCHEMA (strict JSON, no prose outside JSON)
+
+{{
+  "is_match": true | false,
+  "reasoning": "<20+ words, cite text from Abstract>",
+  "confidence": "high" | "medium" | "low"
+}}
+"""
+
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+    user = f"""## TITLE
+{title}
+
+## ABSTRACT
+{abstract if abstract else "[MISSING ABSTRACT — decision based on Title only, lower confidence]"}
+
+Is this paper primarily about {level_code} ({d['name']}) per the criteria above? Output JSON only."""
+
+    return system, user

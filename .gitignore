@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.claude/
+
+# Environment
+.env
+.env.local
+
+# Outputs (large, regenerated)
+outputs/model_*.pt
+outputs/llm_logs/
+outputs/llm_progress/
+outputs/eval_report.json
+outputs/training_log_*.json
+outputs/thresholds_*.json
+outputs/predictions_*.xlsx
+outputs.zip
+
+# Keep these (small, semantic):
+!outputs/.gitkeep
+!outputs/gold_2013_2023.parquet
+!outputs/main_2024_clean.parquet
+!outputs/special_edu_augmented.parquet
+!outputs/ece_augmented.parquet
+!outputs/tvet_augmented.parquet
+!outputs/lll_augmented.parquet
+
+# Data dir (raw Excel is large + sensitive)
+data/*.xlsx
+data/*.xls
+data/*.csv
+!data/.gitkeep
+
+# Configs that might leak secrets
+configs/codebook_hash.txt
