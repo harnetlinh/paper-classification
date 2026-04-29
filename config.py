@@ -117,10 +117,12 @@ ASYMMETRIC_LOSS = {
 }
 
 # Loss type for multi-label tasks. AsymmetricLoss handles imbalance natively
-# but its outputs are poorly calibrated (different threshold per class). BCE
-# with pos_weight keeps outputs calibrated and lets a single threshold work
-# better — switch to "bce_pos_weight" if threshold tuning over-fits the val set.
-MULTILABEL_LOSS = "asymmetric"   # "asymmetric" | "bce_pos_weight"
+# but its outputs are poorly calibrated (different threshold per class — in
+# practice optimal thresholds spanned 0.10-0.99). BCE with pos_weight keeps
+# outputs calibrated and lets threshold tuning settle in a saner range.
+# Default switched to "bce_pos_weight" after the AUC-best-model run regressed
+# Method test F1 vs the original AsymmetricLoss CPU baseline.
+MULTILABEL_LOSS = "bce_pos_weight"   # "asymmetric" | "bce_pos_weight"
 
 # Per-class threshold tuning
 # Step 0.02 (41 candidates per class) finds sharper decision boundaries than
@@ -133,10 +135,15 @@ THRESHOLD_GRID = [round(0.10 + 0.02 * i, 2) for i in range(41)]   # 0.10 → 0.9
 # from chasing noise on classes with 1-3 val positives.
 LOW_SUPPORT_THRESHOLD_FALLBACK = 10
 
-# Best-model selection metric. F1 with default 0.5 threshold under-states the
-# model on rare classes (AsymmetricLoss skews outputs); macro_auc is monotone
-# under the model's actual ranking ability and doesn't depend on a threshold.
-BEST_MODEL_METRIC = "macro_auc"   # "macro_auc" | "macro_f1"
+# Best-model selection metric.
+# - "tuned_macro_f1" (DEFAULT, recommended): tune per-class thresholds on val
+#   each epoch, compute macro-F1 with those thresholds, select best epoch by
+#   that. Matches the actual deployment metric. Adds ~1s/epoch overhead.
+# - "macro_auc": threshold-independent ranking metric. Risk: AUC-best epoch
+#   may not be F1-best (observed regression on Method: epoch 3 had peak AUC
+#   F1=0.500 but epoch 4 had F1=0.532).
+# - "macro_f1": F1 with default threshold 0.5 — biased on uncalibrated losses.
+BEST_MODEL_METRIC = "tuned_macro_f1"
 
 # ==================== LLM CONFIG (OpenAI-only ensemble) ====================
 # 3 different OpenAI models for diversity. All use temperature=0 + seed=SEED for reproducibility.

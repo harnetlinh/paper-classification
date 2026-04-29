@@ -344,15 +344,38 @@ def train_model(task: str, smoke: bool = False):
         val_f1 = val_metrics["macro_f1"]
         val_auc = val_metrics.get("macro_auc", float("nan"))
 
+        # For multi-label tasks, also compute the tuned-F1 estimate this
+        # epoch — that is what threshold tuning will produce at the end of
+        # training, so it's the right metric to drive best-model selection.
+        val_tuned_f1 = float("nan")
+        if target_type == "multi_label":
+            val_probs_ep, val_targets_ep = predict_probs(model, val_loader, device, target_type)
+            low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
+            _, f1s_ep, _ = utils.tune_thresholds_robust(
+                val_probs_ep, val_targets_ep, config.THRESHOLD_GRID,
+                low_support_threshold=low_support,
+            )
+            val_tuned_f1 = float(np.mean(f1s_ep))
+            val_metrics["macro_f1_tuned"] = val_tuned_f1
+
         # Pick which metric drives best-model selection
-        selected_metric = val_auc if best_metric_name == "macro_auc" else val_f1
+        if best_metric_name == "tuned_macro_f1" and target_type == "multi_label":
+            selected_metric = val_tuned_f1
+        elif best_metric_name == "macro_auc":
+            selected_metric = val_auc
+        else:
+            selected_metric = val_f1
         if not np.isfinite(selected_metric):
-            selected_metric = val_f1   # fallback if AUC undefined (e.g. all-empty class)
+            selected_metric = val_f1   # fallback if NaN (e.g. all-empty class)
 
         epoch_log = {"epoch": epoch + 1, "train_loss": avg_train_loss, **val_metrics}
         log.append(epoch_log)
-        print(f"  Epoch {epoch+1}: train_loss={avg_train_loss:.4f}  "
-              f"val_macro_f1={val_f1:.4f}  val_macro_auc={val_auc:.4f}")
+        if target_type == "multi_label":
+            print(f"  Epoch {epoch+1}: loss={avg_train_loss:.4f}  "
+                  f"f1@0.5={val_f1:.4f}  tuned_f1={val_tuned_f1:.4f}  auc={val_auc:.4f}")
+        else:
+            print(f"  Epoch {epoch+1}: loss={avg_train_loss:.4f}  "
+                  f"f1={val_f1:.4f}  auc={val_auc:.4f}")
 
         is_first_epoch = epoch == 0
         improved = selected_metric > best_val_metric

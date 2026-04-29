@@ -299,48 +299,57 @@ def youden_j_threshold(probs_c, targets_c):
     return t, float(j[best_idx])
 
 
-def tune_thresholds_robust(probs, targets, threshold_grid, low_support_threshold=10):
-    """Class-aware robust threshold tuning.
+def tune_thresholds_robust(probs, targets, threshold_grid, low_support_threshold=10,
+                            safe_low=0.3, safe_high=0.7, default_threshold=0.5):
+    """Class-aware F1-driven threshold tuning with a safe range fallback.
 
-    For classes with adequate val support: standard F1-grid tuning (matches
-    `tune_thresholds_per_class`). For low-support classes: fall back to
-    Youden's J on the val ROC curve — support-robust and respects the model's
-    actual ranking ability instead of chasing F1 noise on 1-9 samples.
+    Why not Youden's J: in earlier runs Youden's J picked extreme thresholds
+    (e.g. LLL=0.12, Special edu=0.99) that maximised TPR-FPR but destroyed
+    F1 (recall 100% / precision 1%, or recall 0%). Our optimisation target is
+    F1, so the fallback should also use F1 — just on a constrained range to
+    avoid the over-fitting / spam-predictions modes on tiny val sets.
+
+    Strategy per class:
+    - 0 positives → default threshold (0.5), F1 = 0
+    - support < low_support_threshold → F1-grid restricted to [safe_low, safe_high]
+      (default 0.3-0.7, F1 cannot be optimised at extremes anyway)
+    - support >= low_support_threshold → full F1-grid
 
     Returns:
         (thresholds, f1s, fallback_used)
-        fallback_used: list[bool] — whether Youden's J was used per class.
+        fallback_used: list[bool] — whether the constrained safe range was used.
     """
     from sklearn.metrics import f1_score
     n_classes = targets.shape[1]
     thresholds, f1s, fallback_used = [], [], []
+    safe_grid = [t for t in threshold_grid if safe_low <= t <= safe_high]
+    if not safe_grid:
+        safe_grid = [default_threshold]
+
     for c in range(n_classes):
         n_pos = int(targets[:, c].sum())
         if n_pos == 0:
-            thresholds.append(0.5)
+            thresholds.append(default_threshold)
             f1s.append(0.0)
             fallback_used.append(False)
             continue
-        if n_pos < low_support_threshold:
-            # Use Youden's J — support-robust
-            t, _ = youden_j_threshold(probs[:, c], targets[:, c])
-            preds = (probs[:, c] >= t).astype(int)
-            f1 = f1_score(targets[:, c], preds, zero_division=0)
-            thresholds.append(round(float(t), 4))
-            f1s.append(float(f1))
-            fallback_used.append(True)
-            continue
-        # Standard F1-grid for adequate-support classes
-        best_t, best_f1 = 0.5, 0.0
-        for t in threshold_grid:
+        if n_pos <= low_support_threshold:
+            grid = safe_grid
+            used_fallback = True
+        else:
+            grid = threshold_grid
+            used_fallback = False
+
+        best_t, best_f1 = default_threshold, 0.0
+        for t in grid:
             preds = (probs[:, c] >= t).astype(int)
             f1 = f1_score(targets[:, c], preds, zero_division=0)
             if f1 > best_f1:
                 best_f1 = f1
                 best_t = t
-        thresholds.append(best_t)
-        f1s.append(best_f1)
-        fallback_used.append(False)
+        thresholds.append(round(float(best_t), 4))
+        f1s.append(float(best_f1))
+        fallback_used.append(used_fallback)
     return thresholds, f1s, fallback_used
 
 
