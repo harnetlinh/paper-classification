@@ -172,15 +172,30 @@ class SpecterClassifier(nn.Module):
         return logits
 
 
+def _model_save_path(task: str, seed: int):
+    """Save path for a model. seed=config.SEED uses the legacy single path
+    (`model_{task}.pt`); other seeds use `model_{task}_s{seed}.pt`. This keeps
+    a single-model run drop-in compatible with existing evaluate/inference,
+    while ensemble runs produce sibling files that the loaders can pick up.
+    """
+    if seed == config.SEED:
+        return config.model_path(task)
+    return config.OUTPUT_DIR / f"model_{task}_s{seed}.pt"
+
+
 # ==================== Training ====================
-def train_model(task: str, smoke: bool = False):
+def train_model(task: str, smoke: bool = False, seed: int = None):
     """Train one model for the given task."""
+    if seed is None:
+        seed = config.SEED
+    is_ensemble_seed = seed != config.SEED
     print("=" * 80)
-    print(f"Training task: {task}" + (" [SMOKE TEST MODE]" if smoke else ""))
+    suffix = f"  seed={seed}" + ("  [ENSEMBLE]" if is_ensemble_seed else "")
+    print(f"Training task: {task}{suffix}" + (" [SMOKE TEST MODE]" if smoke else ""))
     print("=" * 80)
-    
+
     # Deterministic setup
-    utils.set_deterministic(config.SEED)
+    utils.set_deterministic(seed)
     
     # Device autodetect
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -379,11 +394,12 @@ def train_model(task: str, smoke: bool = False):
 
         is_first_epoch = epoch == 0
         improved = selected_metric > best_val_metric
+        save_path = _model_save_path(task, seed)
         if improved or is_first_epoch:
             if improved:
                 best_val_metric = selected_metric
                 no_improve = 0
-            torch.save(model.state_dict(), config.model_path(task))
+            torch.save(model.state_dict(), save_path)
             tag = f"★ Saved best ({best_metric_name}={selected_metric:.4f})" if improved \
                 else f"Saved baseline checkpoint ({best_metric_name}={selected_metric:.4f})"
             print(f"    {tag}")
@@ -394,12 +410,15 @@ def train_model(task: str, smoke: bool = False):
                 break
 
     # Reload best
-    if config.model_path(task).exists():
-        model.load_state_dict(torch.load(config.model_path(task), map_location=device))
+    save_path = _model_save_path(task, seed)
+    if save_path.exists():
+        model.load_state_dict(torch.load(save_path, map_location=device))
 
-    # Per-class threshold tuning (multi-label only) — robust variant
-    if target_type == "multi_label" and not smoke:
-        print("\n--- Tuning per-class thresholds (robust: F1-grid + Youden's J fallback) ---")
+    # Per-class threshold tuning (multi-label only) — only for the canonical
+    # seed run; ensemble-seed runs leave threshold tuning to the ensemble
+    # combiner (which averages probabilities across seeds first, then tunes).
+    if target_type == "multi_label" and not smoke and not is_ensemble_seed:
+        print("\n--- Tuning per-class thresholds (robust: F1-grid in safe range) ---")
         val_probs, val_targets = predict_probs(model, val_loader, device, target_type)
         low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
         thresholds, f1s, fallback_used = utils.tune_thresholds_robust(
@@ -409,7 +428,7 @@ def train_model(task: str, smoke: bool = False):
         class_names = get_class_names(task)
         for i, cn in enumerate(class_names):
             if fallback_used[i]:
-                print(f"    [{cn}] used Youden's J (val support too low) → "
+                print(f"    [{cn}] used safe range [0.3, 0.7] (val support too low) → "
                       f"threshold={thresholds[i]:.3f}")
         threshold_data = {
             "thresholds": [float(t) for t in thresholds],
@@ -423,17 +442,19 @@ def train_model(task: str, smoke: bool = False):
             json.dump(threshold_data, f, indent=2, ensure_ascii=False)
         print(f"  Saved thresholds: {config.threshold_path(task)}")
         print(f"  Macro-F1 (tuned thresholds): {np.mean(f1s):.4f}")
-    
-    # Save log
-    log_path = config.OUTPUT_DIR / f"training_log_{task}.json"
+
+    # Save log (per-seed file when ensemble, single file otherwise)
+    log_suffix = f"_s{seed}" if is_ensemble_seed else ""
+    log_path = config.OUTPUT_DIR / f"training_log_{task}{log_suffix}.json"
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump({
             "task": task,
+            "seed": seed,
             "best_val_metric_name": best_metric_name,
             "best_val_metric": float(best_val_metric),
             "log": log,
             "config": {
-                "seed": config.SEED,
+                "seed": seed,
                 "lr": config.LR,
                 "batch_size": batch_size,
                 "epochs": n_epochs,
@@ -444,8 +465,98 @@ def train_model(task: str, smoke: bool = False):
             },
         }, f, indent=2, ensure_ascii=False)
 
-    print(f"\n[DONE] task={task}  best_val_{best_metric_name}={best_val_metric:.4f}")
+    print(f"\n[DONE] task={task}  seed={seed}  best_val_{best_metric_name}={best_val_metric:.4f}")
     return best_val_metric
+
+
+# ==================== Ensemble combiner ====================
+def build_ensemble(task: str):
+    """Combine all seed-trained models into a single ensemble threshold file.
+
+    Loads each seed's trained model, predicts probabilities on val, averages
+    across seeds, then tunes thresholds on the averaged probabilities. The
+    resulting thresholds_{task}.json is the artifact evaluate.py / inference.py
+    pick up — no change needed downstream as long as those paths also load
+    every seed model and average probabilities.
+    """
+    if "fields" not in task and "levels" not in task:
+        # Single-label tasks don't use thresholds; nothing to tune.
+        return None
+
+    seeds = config.ENSEMBLE_SEEDS
+    print("=" * 80)
+    print(f"Building ensemble for {task} — averaging {len(seeds)} seed models")
+    print("=" * 80)
+
+    # Determine target_type / loader once
+    train_df, val_df, test_df = load_train_val_test(task)
+    if task in ("fields", "levels"):
+        target_cols = get_target_cols(task)
+        n_classes = len(target_cols)
+        target_type = "multi_label"
+    else:
+        n_classes = len(config.METHODS_5)
+        target_type = "single_label"
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
+    val_ds = utils.PaperDataset(
+        val_df, tokenizer, target_cols=target_cols, target_type=target_type,
+        method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
+    )
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Aggregate probabilities across seeds
+    sum_probs = None
+    val_targets = None
+    n_loaded = 0
+    for seed in seeds:
+        path = _model_save_path(task, seed)
+        if not path.exists():
+            print(f"  [skip] seed={seed} not trained: {path}")
+            continue
+        model = SpecterClassifier(
+            config.SPECTER2_BASE, n_classes=n_classes,
+            dropout=getattr(config, "DROPOUT", 0.1),
+            revision=getattr(config, "SPECTER2_REVISION", None),
+        ).to(device)
+        model.load_state_dict(torch.load(path, map_location=device))
+        probs_seed, val_targets = predict_probs(model, val_loader, device, target_type)
+        if sum_probs is None:
+            sum_probs = probs_seed
+        else:
+            sum_probs = sum_probs + probs_seed
+        n_loaded += 1
+        print(f"  loaded seed={seed} from {path.name}")
+    if n_loaded == 0:
+        print("  No seed models found; ensemble skipped.")
+        return None
+    avg_probs = sum_probs / n_loaded
+
+    # Tune thresholds on averaged probabilities
+    low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
+    thresholds, f1s, fallback_used = utils.tune_thresholds_robust(
+        avg_probs, val_targets, config.THRESHOLD_GRID,
+        low_support_threshold=low_support,
+    )
+    class_names = get_class_names(task)
+    threshold_data = {
+        "thresholds": [float(t) for t in thresholds],
+        "per_class_f1_at_optimal": [float(f) for f in f1s],
+        "fallback_used": [bool(b) for b in fallback_used],
+        "class_names": class_names,
+        "macro_f1_with_optimal_thresholds": float(np.mean(f1s)),
+        "low_support_threshold_fallback": int(low_support),
+        "ensemble_seeds": list(seeds[:n_loaded]),
+        "n_models_in_ensemble": n_loaded,
+    }
+    with open(config.threshold_path(task), "w", encoding="utf-8") as f:
+        json.dump(threshold_data, f, indent=2, ensure_ascii=False)
+    print(f"  Saved ensemble thresholds: {config.threshold_path(task)}")
+    print(f"  Ensemble macro-F1 (tuned): {np.mean(f1s):.4f}")
+    return float(np.mean(f1s))
 
 
 # ==================== Evaluation helpers ====================
@@ -555,15 +666,25 @@ def main():
     parser.add_argument("--task", choices=["fields", "levels", "method", "all"], required=True)
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke test: 1 epoch, 50 train + 20 val papers, batch 4")
+    parser.add_argument("--ensemble", action="store_true",
+                        help=f"Train {len(config.ENSEMBLE_SEEDS)} seeds and ensemble: "
+                             f"{config.ENSEMBLE_SEEDS}. Linear training-time cost.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override single training seed (default: config.SEED)")
     args = parser.parse_args()
-    
+
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    if args.task == "all":
-        for t in ["fields", "levels", "method"]:
-            train_model(t, smoke=args.smoke)
-    else:
-        train_model(args.task, smoke=args.smoke)
+
+    tasks = ["fields", "levels", "method"] if args.task == "all" else [args.task]
+    seeds = config.ENSEMBLE_SEEDS if args.ensemble else [
+        args.seed if args.seed is not None else config.SEED
+    ]
+
+    for t in tasks:
+        for seed in seeds:
+            train_model(t, smoke=args.smoke, seed=seed)
+        if args.ensemble and not args.smoke:
+            build_ensemble(t)
 
 
 if __name__ == "__main__":

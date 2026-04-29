@@ -34,12 +34,42 @@ import utils
 from train_specter2 import (
     SpecterClassifier, load_train_val_test,
     get_target_cols, get_class_names, predict_probs,
+    _model_save_path,
 )
+
+
+def _list_seed_models(task: str):
+    """Return [(seed, path), ...] for every seed checkpoint that exists.
+
+    Always includes config.SEED (legacy `model_{task}.pt`) plus every additional
+    `ENSEMBLE_SEEDS` entry that has a saved file.
+    """
+    seeds_to_try = [config.SEED] + [
+        s for s in getattr(config, "ENSEMBLE_SEEDS", []) if s != config.SEED
+    ]
+    found = []
+    for seed in seeds_to_try:
+        p = _model_save_path(task, seed)
+        if p.exists():
+            found.append((seed, p))
+    return found
+
+
+def _ensemble_predict(models, loader, device, target_type):
+    """Average probabilities across an ensemble of models."""
+    sum_probs = None
+    targets = None
+    for m in models:
+        probs, t = predict_probs(m, loader, device, target_type)
+        sum_probs = probs if sum_probs is None else sum_probs + probs
+        targets = t
+    return sum_probs / len(models), targets
 
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 # Per-class support below this is considered statistically unreliable.
 LOW_SUPPORT_THRESHOLD = 5
+NAN_STR = "  nan"
 
 
 def _per_class_auc_ap(targets, probs, target_type, n_classes):
@@ -104,11 +134,38 @@ def evaluate_with_thresholds(probs, targets, target_type, n_classes, thresholds=
     macro_auc = float(np.nanmean(aucs)) if any(not np.isnan(a) for a in aucs) else float("nan")
     macro_ap = float(np.nanmean(aps)) if any(not np.isnan(a) for a in aps) else float("nan")
 
+    # Weighted F1: each class contributes proportionally to its support.
+    # Mathematically robust when one class has 0 support — it just gets weight 0.
+    weighted_f1 = float(f1_score(targets, preds, average="weighted", zero_division=0))
+
+    # Supported-class macro F1: only classes with support >= MIN_SUPPORT.
+    # Reports what the model achieves on classes where the metric is reliable.
+    # Particularly important when the dataset has very imbalanced classes
+    # (e.g. Method 'Other' with 0 support, Fields 'Special edu' with val=1
+    # — these contribute pure noise to standard macro F1).
+    supports = list(support)
+    MIN_SUPPORT = 5
+    supported_idx = [i for i, s in enumerate(supports) if s >= MIN_SUPPORT]
+    supported_f1 = (
+        float(np.mean([per_f1[i] for i in supported_idx])) if supported_idx else float("nan")
+    )
+
+    # Test-30 macro: classes with support >= 30 (research-grade reliability).
+    test30_idx = [i for i, s in enumerate(supports) if s >= 30]
+    test30_f1 = (
+        float(np.mean([per_f1[i] for i in test30_idx])) if test30_idx else float("nan")
+    )
+
     return {
         "macro_f1": float(macro_f1),
         "micro_f1": float(micro_f1),
+        "weighted_f1": weighted_f1,
         "macro_auc": macro_auc,
         "macro_ap": macro_ap,
+        "supported_macro_f1": supported_f1,
+        "supported_classes_count": len(supported_idx),
+        "high_support_macro_f1": test30_f1,
+        "high_support_classes_count": len(test30_idx),
         "per_class_precision": [float(x) for x in per_p],
         "per_class_recall": [float(x) for x in per_r],
         "per_class_f1": [float(x) for x in per_f1],
@@ -120,19 +177,35 @@ def evaluate_with_thresholds(probs, targets, target_type, n_classes, thresholds=
 
 def evaluate_task(task: str, device, val_loader, test_loader,
                   target_type: str, n_classes: int):
-    """Run evaluation for one task on both val and test sets."""
+    """Run evaluation for one task on both val and test sets.
+
+    Auto-detects ensemble: if multiple seed checkpoints exist
+    (`model_{task}.pt` + `model_{task}_s{seed}.pt`), loads all of them and
+    averages probabilities. Falls back to a single model if only one exists.
+    """
     from transformers import AutoTokenizer
-    
-    if not config.model_path(task).exists():
-        print(f"[SKIP] {task}: model not trained ({config.model_path(task)})")
+
+    seed_models_paths = _list_seed_models(task)
+    if not seed_models_paths:
+        print(f"[SKIP] {task}: no model checkpoint found at {config.model_path(task)}")
         return None
-    
-    # Load model
+
     print(f"\n=== Evaluating {task} ===")
-    model = SpecterClassifier(config.SPECTER2_BASE, n_classes=n_classes).to(device)
-    state = torch.load(config.model_path(task), map_location=device)
-    model.load_state_dict(state)
-    model.eval()
+    if len(seed_models_paths) > 1:
+        print(f"  Ensemble: averaging {len(seed_models_paths)} seed models "
+              f"({[s for s, _ in seed_models_paths]})")
+    models = []
+    for seed, path in seed_models_paths:
+        m = SpecterClassifier(
+            config.SPECTER2_BASE, n_classes=n_classes,
+            dropout=getattr(config, "DROPOUT", 0.1),
+            revision=getattr(config, "SPECTER2_REVISION", None),
+        ).to(device)
+        m.load_state_dict(torch.load(path, map_location=device))
+        m.eval()
+        models.append(m)
+    # All probability prediction below goes through _ensemble_predict, which
+    # handles the n=1 case identically to a single-model evaluation.
     
     # Load tuned thresholds
     thresholds = None
@@ -149,14 +222,14 @@ def evaluate_task(task: str, device, val_loader, test_loader,
     class_names = get_class_names(task)
     
     # Predict on val + test
-    val_probs, val_targets = predict_probs(model, val_loader, device, target_type)
+    val_probs, val_targets = _ensemble_predict(models, val_loader, device, target_type)
     val_metrics = evaluate_with_thresholds(
         val_probs, val_targets, target_type, n_classes, thresholds
     )
     
     test_metrics = None
     if test_loader is not None and len(test_loader.dataset) > 0:
-        test_probs, test_targets = predict_probs(model, test_loader, device, target_type)
+        test_probs, test_targets = _ensemble_predict(models, test_loader, device, target_type)
         test_metrics = evaluate_with_thresholds(
             test_probs, test_targets, target_type, n_classes, thresholds
         )
@@ -225,17 +298,32 @@ def evaluate_task(task: str, device, val_loader, test_loader,
         report["low_support_classes"] = low_support_classes
 
     # Print summary
+    def _fmt(m, key, default=float("nan")):
+        v = m.get(key, default)
+        if isinstance(v, float) and np.isfinite(v):
+            return f"{v:.4f}"
+        return NAN_STR
     print(f"  Val 2023 (n={len(val_loader.dataset)}):")
-    print(f"    Macro-F1:  {val_metrics['macro_f1']:.4f}")
-    print(f"    Micro-F1:  {val_metrics['micro_f1']:.4f}")
-    print(f"    Macro-AUC: {val_metrics['macro_auc']:.4f}")
-    print(f"    Macro-AP:  {val_metrics['macro_ap']:.4f}")
+    print(f"    Macro-F1:        {_fmt(val_metrics, 'macro_f1')}")
+    print(f"    Micro-F1:        {_fmt(val_metrics, 'micro_f1')}")
+    print(f"    Weighted-F1:     {_fmt(val_metrics, 'weighted_f1')}")
+    print(f"    Macro-AUC:       {_fmt(val_metrics, 'macro_auc')}")
+    print(f"    Macro-AP:        {_fmt(val_metrics, 'macro_ap')}")
+    print(f"    Supported macro-F1 (n>=5):  {_fmt(val_metrics, 'supported_macro_f1')}  "
+          f"({val_metrics.get('supported_classes_count', 0)} classes)")
+    print(f"    High-support macro-F1 (n>=30): {_fmt(val_metrics, 'high_support_macro_f1')}  "
+          f"({val_metrics.get('high_support_classes_count', 0)} classes)")
     if test_metrics:
         print(f"  Test 2024 (n={len(test_loader.dataset)}):")
-        print(f"    Macro-F1:  {test_metrics['macro_f1']:.4f}")
-        print(f"    Micro-F1:  {test_metrics['micro_f1']:.4f}")
-        print(f"    Macro-AUC: {test_metrics['macro_auc']:.4f}")
-        print(f"    Macro-AP:  {test_metrics['macro_ap']:.4f}")
+        print(f"    Macro-F1:        {_fmt(test_metrics, 'macro_f1')}")
+        print(f"    Micro-F1:        {_fmt(test_metrics, 'micro_f1')}")
+        print(f"    Weighted-F1:     {_fmt(test_metrics, 'weighted_f1')}")
+        print(f"    Macro-AUC:       {_fmt(test_metrics, 'macro_auc')}")
+        print(f"    Macro-AP:        {_fmt(test_metrics, 'macro_ap')}")
+        print(f"    Supported macro-F1 (n>=5):  {_fmt(test_metrics, 'supported_macro_f1')}  "
+              f"({test_metrics.get('supported_classes_count', 0)} classes)")
+        print(f"    High-support macro-F1 (n>=30): {_fmt(test_metrics, 'high_support_macro_f1')}  "
+              f"({test_metrics.get('high_support_classes_count', 0)} classes)")
         print(f"    Drift gap (val - test macro-F1): "
               f"{report['drift_gap']['macro_f1_val_minus_test']:+.4f}")
 
@@ -246,12 +334,12 @@ def evaluate_task(task: str, device, val_loader, test_loader,
         v_auc = entry["val_auc"]
         v_n = entry["val_support"]
         warn_tag = " ⚠low" if v_n < LOW_SUPPORT_THRESHOLD else ""
-        auc_str = f"{v_auc:.3f}" if not np.isnan(v_auc) else "  nan"
+        auc_str = f"{v_auc:.3f}" if not np.isnan(v_auc) else NAN_STR
         if test_metrics:
             t_f1 = entry["test_f1"]
             t_auc = entry["test_auc"]
             t_n = entry["test_support"]
-            t_auc_str = f"{t_auc:.3f}" if not np.isnan(t_auc) else "  nan"
+            t_auc_str = f"{t_auc:.3f}" if not np.isnan(t_auc) else NAN_STR
             print(f"    {cn:35s}  val_F1={v_f1:.3f} AUC={auc_str} (n={v_n}){warn_tag}  "
                   f"test_F1={t_f1:.3f} AUC={t_auc_str} (n={t_n})")
         else:

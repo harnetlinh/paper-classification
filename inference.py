@@ -24,8 +24,21 @@ from tqdm import tqdm
 
 import config
 import utils
-from train_specter2 import SpecterClassifier, get_target_cols, get_class_names
+from train_specter2 import SpecterClassifier, get_target_cols, get_class_names, _model_save_path
 from sanitize import normalize_whitespace
+
+
+def _list_seed_models(task: str):
+    """Return [(seed, path), ...] for every seed checkpoint that exists."""
+    seeds_to_try = [config.SEED] + [
+        s for s in getattr(config, "ENSEMBLE_SEEDS", []) if s != config.SEED
+    ]
+    found = []
+    for seed in seeds_to_try:
+        p = _model_save_path(task, seed)
+        if p.exists():
+            found.append((seed, p))
+    return found
 
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
@@ -76,11 +89,25 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
         n_classes = len(config.METHODS_5)
         target_type = "single_label"
     
-    # Load model
-    model = SpecterClassifier(config.SPECTER2_BASE, n_classes=n_classes).to(device)
-    state = torch.load(config.model_path(task), map_location=device)
-    model.load_state_dict(state)
-    model.eval()
+    # Load model(s) — auto-detect ensemble checkpoints
+    seed_models_paths = _list_seed_models(task)
+    if not seed_models_paths:
+        raise FileNotFoundError(
+            f"No model checkpoint for task={task}. Expected {config.model_path(task)}"
+        )
+    models = []
+    for seed, path in seed_models_paths:
+        m = SpecterClassifier(
+            config.SPECTER2_BASE, n_classes=n_classes,
+            dropout=getattr(config, "DROPOUT", 0.1),
+            revision=getattr(config, "SPECTER2_REVISION", None),
+        ).to(device)
+        m.load_state_dict(torch.load(path, map_location=device))
+        m.eval()
+        models.append(m)
+    if len(models) > 1:
+        print(f"  Ensemble: averaging {len(models)} seed models "
+              f"({[s for s, _ in seed_models_paths]})")
     
     # Load tuned thresholds (multi-label only)
     thresholds = None
@@ -104,19 +131,22 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
         return_tensors="pt",
     )
     
-    # Batched inference
+    # Batched inference — average probabilities across ensemble models
     n = len(df)
     all_probs = []
     with torch.no_grad():
         for i in tqdm(range(0, n, config.BATCH_SIZE), desc=f"{task} inference"):
             batch_ids = enc["input_ids"][i:i+config.BATCH_SIZE].to(device)
             batch_mask = enc["attention_mask"][i:i+config.BATCH_SIZE].to(device)
-            logits = model(batch_ids, batch_mask)
-            if target_type == "multi_label":
-                probs = torch.sigmoid(logits).cpu().numpy()
-            else:
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()
-            all_probs.append(probs)
+            sum_probs = None
+            for m in models:
+                logits = m(batch_ids, batch_mask)
+                if target_type == "multi_label":
+                    p = torch.sigmoid(logits).cpu().numpy()
+                else:
+                    p = torch.softmax(logits, dim=-1).cpu().numpy()
+                sum_probs = p if sum_probs is None else sum_probs + p
+            all_probs.append(sum_probs / len(models))
     probs = np.concatenate(all_probs)
     
     # Build output columns
@@ -140,7 +170,7 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
         out_cols[f"{task}_confidence"] = probs.max(axis=1).round(4)
     
     # Free memory
-    del model, state
+    del models
     if device.type == "cuda":
         torch.cuda.empty_cache()
     

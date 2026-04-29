@@ -145,6 +145,13 @@ LOW_SUPPORT_THRESHOLD_FALLBACK = 10
 # - "macro_f1": F1 with default threshold 0.5 — biased on uncalibrated losses.
 BEST_MODEL_METRIC = "tuned_macro_f1"
 
+# ==================== ENSEMBLE CONFIG ====================
+# Multi-seed ensemble: train N independent models with different seeds, average
+# their probabilities at evaluation/inference time. Empirically yields +2-5%
+# F1 on small-data fine-tunes by averaging out unlucky initialization /
+# data-shuffling artefacts. Cost: linear in N (3 seeds = 3x training time).
+ENSEMBLE_SEEDS = [42, 123, 456]   # 1 seed = no ensemble; 3+ seeds = ensemble
+
 # ==================== LLM CONFIG (OpenAI-only ensemble) ====================
 # 3 different OpenAI models for diversity. All use temperature=0 + seed=SEED for reproducibility.
 # Pricing (April 2026):
