@@ -115,9 +115,9 @@ def predict_split(df: pd.DataFrame, task: str, device, tokenizer):
     sum_probs = None
     for seed, path in seed_models:
         model = SpecterClassifier(
-            config.SPECTER2_BASE, n_classes=n_classes,
+            config.BACKBONE_MODEL, n_classes=n_classes,
             dropout=getattr(config, "DROPOUT", 0.1),
-            revision=getattr(config, "SPECTER2_REVISION", None),
+            revision=getattr(config, "BACKBONE_REVISION", None),
         ).to(device)
         model.load_state_dict(torch.load(path, map_location=device))
         model.eval()
@@ -441,7 +441,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
 
     sheets = {}
 

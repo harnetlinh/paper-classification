@@ -355,20 +355,34 @@ def tune_thresholds_robust(probs, targets, threshold_grid, low_support_threshold
 
 # ==================== Calibrated weighted BCE (alternative loss) ====================
 class WeightedBCEWithLogitsLoss(nn.Module):
-    """BCE-with-logits using `pos_weight` per class for imbalance handling.
+    """BCE-with-logits using `pos_weight` per class + optional label smoothing.
 
     Unlike AsymmetricLoss, this keeps sigmoid outputs well-calibrated — meaning
     a single near-0.5 threshold works across most classes and threshold tuning
-    does not have to compensate for a class-specific bias. Often gives more
-    stable F1 on small datasets where AsymmetricLoss's per-class output skew
-    is hard to threshold correctly.
+    does not have to compensate for a class-specific bias.
+
+    Label smoothing (Müller et al. 2019): replace hard 0/1 targets with
+    (smoothing/2, 1 - smoothing/2). Reduces over-confidence and combats the
+    severe overfit observed at epoch 7+ (train_loss → 0.21 while val plateaus
+    around 0.54). Typical empirical gain on small datasets: +1-3% F1 from
+    smoother probability outputs that survive the val/test distribution shift
+    better than perfectly-fit train predictions.
+
+    Args:
+        pos_weight: per-class [n_classes] tensor — passed straight to BCE
+        class_weight: per-class [n_classes] tensor — multiplied per element
+        label_smoothing: float in [0, 0.3]; 0 disables (default)
     """
-    def __init__(self, pos_weight=None, class_weight=None):
+    def __init__(self, pos_weight=None, class_weight=None, label_smoothing: float = 0.0):
         super().__init__()
         self.pos_weight = pos_weight
         self.class_weight = class_weight
+        self.label_smoothing = float(label_smoothing)
 
     def forward(self, logits, targets):
+        if self.label_smoothing > 0:
+            half = self.label_smoothing / 2.0
+            targets = targets * (1.0 - self.label_smoothing) + half
         loss = nn.functional.binary_cross_entropy_with_logits(
             logits, targets,
             pos_weight=self.pos_weight.to(logits.device) if self.pos_weight is not None else None,

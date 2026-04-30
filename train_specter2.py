@@ -228,7 +228,7 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
     
     # Tokenizer
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
     
     # Datasets
     method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
@@ -256,11 +256,11 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     
     # Model
-    print(f"Loading SPECTER2 base model ({config.SPECTER2_BASE})...")
+    print(f"Loading SPECTER2 base model ({config.BACKBONE_MODEL})...")
     model = SpecterClassifier(
-        config.SPECTER2_BASE, n_classes=n_classes,
+        config.BACKBONE_MODEL, n_classes=n_classes,
         dropout=getattr(config, "DROPOUT", 0.1),
-        revision=getattr(config, "SPECTER2_REVISION", None),
+        revision=getattr(config, "BACKBONE_REVISION", None),
     ).to(device)
 
     # Loss
@@ -269,11 +269,14 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
         loss_choice = getattr(config, "MULTILABEL_LOSS", "asymmetric")
         if loss_choice == "bce_pos_weight":
             pos_weight = utils.compute_pos_weight(train_df, target_cols).to(device)
+            ls = float(getattr(config, "LABEL_SMOOTHING", 0.0))
             loss_fn = utils.WeightedBCEWithLogitsLoss(
                 pos_weight=pos_weight,
                 class_weight=class_weights,
+                label_smoothing=ls,
             )
-            print(f"  Loss: WeightedBCEWithLogits (pos_weight + class_weight) — calibrated outputs")
+            ls_tag = f", label_smoothing={ls}" if ls > 0 else ""
+            print(f"  Loss: WeightedBCEWithLogits (pos_weight + class_weight{ls_tag}) — calibrated outputs")
         else:
             loss_fn = utils.AsymmetricLoss(
                 gamma_pos=config.ASYMMETRIC_LOSS["gamma_pos"],
@@ -499,7 +502,7 @@ def build_ensemble(task: str):
         target_type = "single_label"
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
     method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
     val_ds = utils.PaperDataset(
         val_df, tokenizer, target_cols=target_cols, target_type=target_type,
@@ -518,9 +521,9 @@ def build_ensemble(task: str):
             print(f"  [skip] seed={seed} not trained: {path}")
             continue
         model = SpecterClassifier(
-            config.SPECTER2_BASE, n_classes=n_classes,
+            config.BACKBONE_MODEL, n_classes=n_classes,
             dropout=getattr(config, "DROPOUT", 0.1),
-            revision=getattr(config, "SPECTER2_REVISION", None),
+            revision=getattr(config, "BACKBONE_REVISION", None),
         ).to(device)
         model.load_state_dict(torch.load(path, map_location=device))
         probs_seed, val_targets = predict_probs(model, val_loader, device, target_type)

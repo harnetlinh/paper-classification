@@ -39,7 +39,7 @@ python llm_augment.py --class all
 # 3. Train 3 models
 python train_specter2.py --task all
 
-# 4. Evaluate
+# 4. Evaluate (auto-applies test-time augmentation if config.TTA_VARIANTS set)
 python evaluate.py --task all
 cat outputs/eval_report.json | python -m json.tool | less
 
@@ -49,6 +49,20 @@ python export_review.py --output outputs/review.xlsx
 # disagreements-first, sheet `disagreements_test_2024` is filtered to only
 # papers needing human review.
 ```
+
+### Performance levers (config.py)
+
+After the initial run plateaus around macro-F1 ~0.55 / AUC ~0.81, the
+following knobs are available for getting further. None require code edits
+— flip the constant in `config.py` and rerun training.
+
+| Knob | Default | Higher-effort alternative | Expected gain |
+|---|---|---|---|
+| `BACKBONE_MODEL` | `allenai/specter2_base` (110M) | `intfloat/multilingual-e5-base` (278M, multilingual) — better for Vietnamese-flavoured English. Drop `BATCH_SIZE` to 16 if OOM. | +3-7% F1 |
+| `LABEL_SMOOTHING` | `0.05` (BCE+pos_weight) | Try `0.1` if overfit signal stronger | +1-3% F1 |
+| `TTA_VARIANTS` | `[title_then_abstract, abstract_then_title]` | Set to `None` to disable; or add custom variants | +1-3% F1 |
+| `ENSEMBLE_SEEDS` | `[42, 123, 456]` | More seeds = smoother ensemble; cost is linear | +2-5% F1 |
+| `MULTILABEL_LOSS` | `bce_pos_weight` (calibrated) | `asymmetric` (older default; more aggressive on imbalance but harder to threshold) | task-dependent |
 
 ## Pipeline tổng quan
 

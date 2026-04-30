@@ -89,13 +89,29 @@ VAL_YEAR = 2023
 TEST_YEAR = 2024
 
 # ==================== MODEL CONFIG ====================
-SPECTER2_BASE = "allenai/specter2_base"
+# Encoder backbone. SPECTER2_base is paper-domain pretrained (110M, fast on T4)
+# but its English-only training may underperform on Vietnamese-flavoured English
+# abstracts. Stronger alternatives — switch via BACKBONE_MODEL:
+#   - "allenai/specter2_base"        : 110M paper-domain (default)
+#   - "intfloat/multilingual-e5-base": 278M multilingual (covers Vietnamese)
+#   - "intfloat/multilingual-e5-large": 560M multilingual (T4 16GB OK at batch=16)
+#   - "microsoft/deberta-v3-base"    : 184M strong English classifier
+SPECTER2_BASE = "allenai/specter2_base"   # legacy name, kept for backward compat
+BACKBONE_MODEL = SPECTER2_BASE             # what train/eval/inference actually load
 # Pin a known-good revision for full reproducibility across machines / Colab.
 # Set to None to always use HF Hub `main` (less stable but always-fresh).
 SPECTER2_REVISION = None
+BACKBONE_REVISION = SPECTER2_REVISION
 SPECTER2_ADAPTER = "allenai/specter2_classification"
 MAX_LENGTH = 512
 DROPOUT = 0.2   # Slightly higher than the previous 0.1 to combat overfit on small data.
+
+# When switching backbone, batch size may need to drop to fit in T4 16GB:
+#   specter2_base / e5-base / deberta-v3-base : batch 32 OK
+#   e5-large / deberta-v3-large               : drop to batch 16
+# Set to None to use the global BATCH_SIZE; or override per-task:
+#   BACKBONE_BATCH_SIZE = {"intfloat/multilingual-e5-large": 16}
+BACKBONE_BATCH_SIZE = None
 
 # ==================== TRAINING CONFIG ====================
 # CPU and GPU need different defaults. The torch.cuda.is_available() probe at
@@ -124,6 +140,13 @@ ASYMMETRIC_LOSS = {
 # Method test F1 vs the original AsymmetricLoss CPU baseline.
 MULTILABEL_LOSS = "bce_pos_weight"   # "asymmetric" | "bce_pos_weight"
 
+# Label smoothing for BCE (only used when MULTILABEL_LOSS == "bce_pos_weight").
+# Replaces hard 0/1 targets with (smoothing/2, 1-smoothing/2). Combats the
+# observed severe overfit (train_loss → 0.21 while val plateaus 0.54) by
+# stopping the model from being maximally confident on training labels.
+# 0.0 disables; 0.05–0.10 is the typical sweet spot.
+LABEL_SMOOTHING = 0.05
+
 # Per-class threshold tuning
 # Step 0.02 (41 candidates per class) finds sharper decision boundaries than
 # step 0.05 with negligible compute cost (~492 f1_score calls per task).
@@ -151,6 +174,16 @@ BEST_MODEL_METRIC = "tuned_macro_f1"
 # F1 on small-data fine-tunes by averaging out unlucky initialization /
 # data-shuffling artefacts. Cost: linear in N (3 seeds = 3x training time).
 ENSEMBLE_SEEDS = [42, 123, 456]   # 1 seed = no ensemble; 3+ seeds = ensemble
+
+# ==================== TEST-TIME AUGMENTATION ====================
+# At evaluation/inference time, predict on multiple text variants per paper
+# and average their probabilities. The variants below preserve the same
+# semantic content but flip the order in the [SEP]-separated input — useful
+# because BERT-style encoders are order-sensitive and ensembling over slight
+# variants typically gives +1-3% F1 free.
+# Set to None or [] to disable; default order pairs are (Title, Abstract)
+# and the swapped (Abstract, Title) — same paper, encoder sees it twice.
+TTA_VARIANTS = ["title_then_abstract", "abstract_then_title"]
 
 # ==================== LLM CONFIG (OpenAI-only ensemble) ====================
 # 3 different OpenAI models for diversity. All use temperature=0 + seed=SEED for reproducibility.

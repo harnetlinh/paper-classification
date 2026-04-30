@@ -65,6 +65,51 @@ def _ensemble_predict(models, loader, device, target_type):
         targets = t
     return sum_probs / len(models), targets
 
+
+def _tta_loaders(df, tokenizer, target_cols, target_type, method_to_idx, max_length, batch_size):
+    """Build a list of (variant_name, DataLoader) for the configured TTA variants.
+
+    Each variant materialises a separate PaperDataset that reorders Title/Abstract
+    in the [SEP]-separated input. Falls back to a single canonical loader if no
+    TTA variants are configured.
+    """
+    variants = getattr(config, "TTA_VARIANTS", None) or ["title_then_abstract"]
+    loaders = []
+    for variant in variants:
+        df_view = df.copy()
+        if variant == "abstract_then_title":
+            # Swap so the encoder sees Abstract before Title.
+            df_view = df_view.rename(columns={"Title": "_Title_orig", "Abstract": "_Abstract_orig"})
+            df_view["Title"] = df_view["_Abstract_orig"]
+            df_view["Abstract"] = df_view["_Title_orig"]
+        ds = utils.PaperDataset(
+            df_view, tokenizer,
+            target_cols=target_cols, target_type=target_type,
+            method_to_idx=method_to_idx, max_length=max_length,
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        loaders.append((variant, loader))
+    return loaders
+
+
+def _ensemble_predict_with_tta(models, loaders, device, target_type):
+    """Average probabilities across an ensemble of models AND TTA variants.
+
+    Cardinality of the average: len(models) * len(loaders).
+    Targets come from the first loader (all TTA loaders share the same labels).
+    """
+    sum_probs = None
+    targets = None
+    n = 0
+    for m in models:
+        for variant, loader in loaders:
+            probs, t = predict_probs(m, loader, device, target_type)
+            sum_probs = probs if sum_probs is None else sum_probs + probs
+            if targets is None:
+                targets = t
+            n += 1
+    return sum_probs / max(1, n), targets
+
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 # Per-class support below this is considered statistically unreliable.
@@ -176,12 +221,18 @@ def evaluate_with_thresholds(probs, targets, target_type, n_classes, thresholds=
 
 
 def evaluate_task(task: str, device, val_loader, test_loader,
-                  target_type: str, n_classes: int):
+                  target_type: str, n_classes: int,
+                  val_df=None, test_df=None, tokenizer=None,
+                  target_cols=None, method_to_idx=None):
     """Run evaluation for one task on both val and test sets.
 
     Auto-detects ensemble: if multiple seed checkpoints exist
     (`model_{task}.pt` + `model_{task}_s{seed}.pt`), loads all of them and
     averages probabilities. Falls back to a single model if only one exists.
+
+    If `val_df` / `tokenizer` are provided, also applies test-time augmentation
+    using `config.TTA_VARIANTS` (defaults to title-then-abstract +
+    abstract-then-title). Probabilities are averaged across (models × variants).
     """
     from transformers import AutoTokenizer
 
@@ -197,9 +248,9 @@ def evaluate_task(task: str, device, val_loader, test_loader,
     models = []
     for seed, path in seed_models_paths:
         m = SpecterClassifier(
-            config.SPECTER2_BASE, n_classes=n_classes,
+            config.BACKBONE_MODEL, n_classes=n_classes,
             dropout=getattr(config, "DROPOUT", 0.1),
-            revision=getattr(config, "SPECTER2_REVISION", None),
+            revision=getattr(config, "BACKBONE_REVISION", None),
         ).to(device)
         m.load_state_dict(torch.load(path, map_location=device))
         m.eval()
@@ -222,14 +273,37 @@ def evaluate_task(task: str, device, val_loader, test_loader,
     class_names = get_class_names(task)
     
     # Predict on val + test
-    val_probs, val_targets = _ensemble_predict(models, val_loader, device, target_type)
+    # If TTA inputs provided, build per-variant loaders and average across them.
+    use_tta = (val_df is not None and tokenizer is not None
+               and bool(getattr(config, "TTA_VARIANTS", None)))
+    if use_tta:
+        val_loaders = _tta_loaders(
+            val_df, tokenizer, target_cols, target_type, method_to_idx,
+            config.MAX_LENGTH, config.BATCH_SIZE,
+        )
+        print(f"  TTA variants on val: {[v for v, _ in val_loaders]}")
+        val_probs, val_targets = _ensemble_predict_with_tta(
+            models, val_loaders, device, target_type,
+        )
+    else:
+        val_probs, val_targets = _ensemble_predict(models, val_loader, device, target_type)
     val_metrics = evaluate_with_thresholds(
         val_probs, val_targets, target_type, n_classes, thresholds
     )
     
     test_metrics = None
     if test_loader is not None and len(test_loader.dataset) > 0:
-        test_probs, test_targets = _ensemble_predict(models, test_loader, device, target_type)
+        if use_tta and test_df is not None:
+            test_loaders = _tta_loaders(
+                test_df, tokenizer, target_cols, target_type, method_to_idx,
+                config.MAX_LENGTH, config.BATCH_SIZE,
+            )
+            print(f"  TTA variants on test: {[v for v, _ in test_loaders]}")
+            test_probs, test_targets = _ensemble_predict_with_tta(
+                models, test_loaders, device, target_type,
+            )
+        else:
+            test_probs, test_targets = _ensemble_predict(models, test_loader, device, target_type)
         test_metrics = evaluate_with_thresholds(
             test_probs, test_targets, target_type, n_classes, thresholds
         )
@@ -352,6 +426,41 @@ def evaluate_task(task: str, device, val_loader, test_loader,
     return report
 
 
+def build_eval_inputs(task: str):
+    """Return everything needed to build val/test loaders (with optional TTA).
+
+    Replaces the previous `build_loaders` two-DataLoader return — TTA needs
+    the underlying DataFrame + tokenizer to materialise variant loaders, so
+    we expose those here and let the caller build loaders on demand.
+    """
+    from transformers import AutoTokenizer
+
+    train_df, val_df, test_df = load_train_val_test(task)
+
+    if task in ("fields", "levels"):
+        target_cols = get_target_cols(task)
+        n_classes = len(target_cols)
+        target_type = "multi_label"
+    else:
+        target_cols = None
+        n_classes = len(config.METHODS_5)
+        target_type = "single_label"
+
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
+    method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
+
+    return {
+        "train_df": train_df,
+        "val_df": val_df,
+        "test_df": test_df,
+        "tokenizer": tokenizer,
+        "target_cols": target_cols,
+        "target_type": target_type,
+        "n_classes": n_classes,
+        "method_to_idx": method_to_idx,
+    }
+
+
 def build_loaders(task: str):
     """Build val and test DataLoaders for a task."""
     from transformers import AutoTokenizer
@@ -367,7 +476,7 @@ def build_loaders(task: str):
         n_classes = len(config.METHODS_5)
         target_type = "single_label"
     
-    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
     method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
     
     val_ds = utils.PaperDataset(
@@ -405,7 +514,7 @@ def main():
     full_report = {
         "config": {
             "seed": config.SEED,
-            "specter2_base": config.SPECTER2_BASE,
+            "specter2_base": config.BACKBONE_MODEL,
             "max_length": config.MAX_LENGTH,
         },
         "tasks": {},
@@ -416,8 +525,28 @@ def main():
             print(f"\n[SKIP] {task}: model not found ({config.model_path(task)})")
             continue
         
-        val_loader, test_loader, target_type, n_classes = build_loaders(task)
-        report = evaluate_task(task, device, val_loader, test_loader, target_type, n_classes)
+        inputs = build_eval_inputs(task)
+        val_ds = utils.PaperDataset(
+            inputs["val_df"], inputs["tokenizer"],
+            target_cols=inputs["target_cols"], target_type=inputs["target_type"],
+            method_to_idx=inputs["method_to_idx"], max_length=config.MAX_LENGTH,
+        )
+        val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+        test_loader = None
+        if len(inputs["test_df"]) > 0:
+            test_ds = utils.PaperDataset(
+                inputs["test_df"], inputs["tokenizer"],
+                target_cols=inputs["target_cols"], target_type=inputs["target_type"],
+                method_to_idx=inputs["method_to_idx"], max_length=config.MAX_LENGTH,
+            )
+            test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+        report = evaluate_task(
+            task, device, val_loader, test_loader,
+            inputs["target_type"], inputs["n_classes"],
+            val_df=inputs["val_df"], test_df=inputs["test_df"],
+            tokenizer=inputs["tokenizer"], target_cols=inputs["target_cols"],
+            method_to_idx=inputs["method_to_idx"],
+        )
         if report is not None:
             full_report["tasks"][task] = report
     

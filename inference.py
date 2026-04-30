@@ -98,9 +98,9 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
     models = []
     for seed, path in seed_models_paths:
         m = SpecterClassifier(
-            config.SPECTER2_BASE, n_classes=n_classes,
+            config.BACKBONE_MODEL, n_classes=n_classes,
             dropout=getattr(config, "DROPOUT", 0.1),
-            revision=getattr(config, "SPECTER2_REVISION", None),
+            revision=getattr(config, "BACKBONE_REVISION", None),
         ).to(device)
         m.load_state_dict(torch.load(path, map_location=device))
         m.eval()
@@ -202,7 +202,7 @@ def main():
     
     # Tokenizer (loaded once, shared)
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
     
     # Run inference for each task
     fields_out = predict_task(df, "fields", device, tokenizer)
