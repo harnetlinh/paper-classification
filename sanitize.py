@@ -29,6 +29,17 @@ import config
 warnings.filterwarnings("ignore")
 
 
+# Rich-feature columns carried through from the source main sheet.
+# These are expert-supplied / metadata signals not used by Title+Abstract alone:
+#   - Author Keywords: ~90 chars/paper, near-direct topic markers
+#   - Source title:    journal name, strongly correlated with Field/Level
+#   - Document type:   ARTICLE / BOOK CHAPTER / REVIEW — strong Method signal
+COL_AUTHOR_KEYWORDS = "Author Keywords"
+COL_SOURCE_TITLE = "Source title"
+COL_DOCUMENT_TYPE = "Document type"
+RICH_FEATURE_COLS = [COL_AUTHOR_KEYWORDS, COL_SOURCE_TITLE, COL_DOCUMENT_TYPE]
+
+
 # ==================== HELPERS ====================
 def normalize_whitespace(s):
     """Replace newlines/tabs with single space, collapse multiple spaces, strip."""
@@ -209,8 +220,13 @@ def process_gold(df_gold: pd.DataFrame, df_main: pd.DataFrame) -> pd.DataFrame:
         n_recovered = int(recovered.notna().sum())
         print(f"Recovered Total_ID for {n_recovered}/{n_missing} rows via Title match (Year=2023)")
 
-    # Join with main để lấy Year
-    df_main_subset = df_main[["Total_ID", "Year"]].copy()
+    # Join with main to pull Year + rich metadata (Author Keywords, Source title,
+    # Document type). These columns exist on every 2997-row main-sheet entry but
+    # are NOT present in the gold sheet — fetching them via Total_ID join is the
+    # cleanest way to enrich the training input without changing label semantics.
+    main_keep = ["Total_ID", "Year"] + RICH_FEATURE_COLS
+    main_subset_cols = [c for c in main_keep if c in df_main.columns]
+    df_main_subset = df_main[main_subset_cols].copy()
     df_main_subset["Total_ID"] = pd.to_numeric(df_main_subset["Total_ID"], errors="coerce")
     df_gold["Total_ID"] = pd.to_numeric(df_gold["Total_ID"], errors="coerce")
     df_gold = df_gold.merge(df_main_subset, on="Total_ID", how="left", suffixes=("", "_main"))
@@ -225,20 +241,33 @@ def process_gold(df_gold: pd.DataFrame, df_main: pd.DataFrame) -> pd.DataFrame:
     
     df_gold["Year"] = df_gold["Year"].astype(int)
     
-    # Final select columns
-    out = df_gold[[
+    # Normalise rich metadata columns brought in via the join. Empty / NaN gets
+    # turned into "" so downstream string concatenation never sees None.
+    for col in RICH_FEATURE_COLS:
+        if col not in df_gold.columns:
+            df_gold[col] = ""
+        df_gold[col] = df_gold[col].apply(normalize_whitespace)
+
+    # Final select columns. Rich-feature cols are carried through so PaperDataset
+    # (utils.py) can optionally include them in the input string when
+    # config.USE_RICH_FEATURES is True. They are textual context — they enrich
+    # without touching the label set.
+    base_cols = [
         "Total_ID", "Year", "Title", "Abstract",
         "fields_list", "levels_list", "method_clean",
-    ]].rename(columns={"method_clean": "method"}).copy()
-    
+    ]
+    out = df_gold[base_cols + RICH_FEATURE_COLS].rename(
+        columns={"method_clean": "method"}
+    ).copy()
+
     # Add binary indicator columns cho Fields (12 cột)
     for f in config.FIELDS_12:
         out[f"field_{config.FIELDS_12.index(f):02d}"] = out["fields_list"].apply(lambda lst: f in lst)
-    
+
     # Add binary indicator cho Levels (6 cột)
     for l in config.LEVELS_6:
         out[f"level_{l}"] = out["levels_list"].apply(lambda lst: l in lst)
-    
+
     return out
 
 
@@ -323,11 +352,20 @@ def process_main_2024(df_main: pd.DataFrame) -> pd.DataFrame:
     # Final fields
     df["Total_ID"] = pd.to_numeric(df["Total_ID"], errors="coerce")
     df["Year"] = df["Year"].astype(int)
-    
-    out = df[[
+
+    # Rich-feature normalisation (same treatment as gold split)
+    for col in RICH_FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].apply(normalize_whitespace)
+
+    base_cols = [
         "Total_ID", "Year", "Title", "Abstract",
         "fields_list", "levels_list", "method_clean",
-    ]].rename(columns={"method_clean": "method"}).copy()
+    ]
+    out = df[base_cols + RICH_FEATURE_COLS].rename(
+        columns={"method_clean": "method"}
+    ).copy()
     
     # Add binary indicator columns matching gold schema
     for f in config.FIELDS_12:

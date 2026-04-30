@@ -130,6 +130,47 @@ class FocalCrossEntropyLoss(nn.Module):
         return loss.mean()
 
 
+# ==================== Input-text builder ====================
+# Single source of truth for how a paper row gets serialised into the
+# [SEP]-separated string we hand to the tokenizer. PaperDataset (training/eval)
+# AND inference.py / export_review.py all call this so the text format is
+# identical across train / eval / inference / review.
+def build_input_texts(df, sep: str):
+    """Concatenate per-paper input fields into one string each.
+
+    Always uses Title + Abstract. When config.USE_RICH_FEATURES is True
+    (default) and the dataframe has the corresponding columns, also appends
+    Author Keywords / Source title / Document type — each prefixed with a
+    short tag so the encoder can tell them apart from the abstract.
+
+    Field-missing rows: the corresponding section is silently skipped; we
+    never insert the literal string "None" or "nan" into the input.
+    """
+    use_rich = bool(getattr(config, "USE_RICH_FEATURES", False))
+    has_kw = use_rich and "Author Keywords" in df.columns
+    has_src = use_rich and "Source title" in df.columns
+    has_dt = use_rich and "Document type" in df.columns
+
+    texts = []
+    for i in range(len(df)):
+        row = df.iloc[i]
+        parts = [str(row.get("Title", "")).strip(), str(row.get("Abstract", "")).strip()]
+        if has_kw:
+            kw = str(row.get("Author Keywords", "") or "").strip()
+            if kw and kw.lower() not in ("nan", "none"):
+                parts.append(f"Keywords: {kw}")
+        if has_src:
+            src = str(row.get("Source title", "") or "").strip()
+            if src and src.lower() not in ("nan", "none"):
+                parts.append(f"Journal: {src}")
+        if has_dt:
+            dt = str(row.get("Document type", "") or "").strip()
+            if dt and dt.lower() not in ("nan", "none"):
+                parts.append(f"Type: {dt}")
+        texts.append(sep.join(parts))
+    return texts
+
+
 # ==================== Dataset ====================
 class PaperDataset(Dataset):
     """
@@ -157,10 +198,7 @@ class PaperDataset(Dataset):
     
     def _tokenize_all(self):
         sep = self.tokenizer.sep_token
-        texts = [
-            (str(t).strip() + sep + str(a).strip())
-            for t, a in zip(self.df["Title"], self.df["Abstract"])
-        ]
+        texts = build_input_texts(self.df, sep)
         return self.tokenizer(
             texts,
             padding="max_length",

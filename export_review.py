@@ -100,12 +100,10 @@ def predict_split(df: pd.DataFrame, task: str, device, tokenizer):
             f"No checkpoint for task={task}. Run train_specter2.py --task {task} first."
         )
 
-    # Pre-tokenize once
+    # Pre-tokenize once — same input builder as training so the model sees
+    # the same field layout it was trained on.
     sep = tokenizer.sep_token
-    texts = [
-        (str(t).strip() + sep + str(a).strip())
-        for t, a in zip(df["Title"], df["Abstract"])
-    ]
+    texts = utils.build_input_texts(df, sep)
     enc = tokenizer(
         texts, padding="max_length", truncation=True,
         max_length=config.MAX_LENGTH, return_tensors="pt",
@@ -403,6 +401,46 @@ def write_workbook(output_path, sheets):
     wb.save(output_path)
 
 
+def write_csv_bundle(output_path, sheets):
+    """Write each sheet as a separate CSV under a directory, plus a manifest.
+
+    Useful when the reviewer can't open .xlsx (corrupted download, no Excel
+    installed, sandboxed environment that won't unzip xlsx). Each sheet
+    becomes <output_dir>/<sheet_name>.csv plus an INDEX.txt with the
+    column glossary.
+    """
+    base = Path(output_path)
+    if base.suffix.lower() == ".xlsx":
+        base = base.with_suffix("")
+    base = base.parent / (base.name + "_csv")
+    base.mkdir(parents=True, exist_ok=True)
+
+    for name, df in sheets.items():
+        csv_path = base / f"{name}.csv"
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")   # BOM for Excel-friendly Unicode
+    # Manifest
+    index_path = base / "INDEX.txt"
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(f"Review bundle — {len(sheets)} sheets exported as CSV\n")
+        f.write("=" * 60 + "\n\n")
+        f.write("Sheets in this bundle (open any in Excel / Numbers / Google Sheets):\n\n")
+        for name, df in sheets.items():
+            f.write(f"  - {name}.csv  ({len(df)} rows, {len(df.columns)} cols)\n")
+        f.write("\nSuggested workflow:\n")
+        f.write("  1. Open `summary_test_2024.csv` first — papers sorted by\n")
+        f.write("     review_priority. HIGH = model disagrees on all 3 task\n")
+        f.write("     types, MEDIUM = 2/3, LOW = 1/3, OK = full agreement.\n")
+        f.write("  2. `disagreements_test_2024.csv` is the same data filtered\n")
+        f.write("     to HIGH priority only (the focused review backlog).\n")
+        f.write("  3. For per-class drill-down, open `fields_test_2024.csv`,\n")
+        f.write("     `levels_test_2024.csv`, `method_test_2024.csv`. Filter by\n")
+        f.write("     <class>__status = FP / FN to see model errors.\n")
+        f.write("  4. `stats_*.csv` — per-class precision/recall/F1.\n")
+        f.write("  5. CSV files are UTF-8 with BOM, so Excel and Sheets show\n")
+        f.write("     Vietnamese characters correctly without re-encoding.\n")
+    return base
+
+
 # ==================== Main ====================
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -412,6 +450,11 @@ def main():
                         help="Which split(s) to export (default: all)")
     parser.add_argument("--abstract-chars", type=int, default=300,
                         help="Truncate abstract to N chars in output (default 300)")
+    parser.add_argument("--csv", action="store_true",
+                        help="ALSO emit a CSV bundle alongside the .xlsx — "
+                             "useful when the reviewer can't open Excel files. "
+                             "Each sheet becomes <output>_csv/<sheet>.csv with "
+                             "UTF-8 BOM for Excel/Sheets-friendly Vietnamese.")
     args = parser.parse_args()
 
     # Validate trained models
@@ -511,6 +554,9 @@ def main():
 
     print(f"\nWriting {args.output}...")
     write_workbook(args.output, sheets)
+    if args.csv:
+        bundle_dir = write_csv_bundle(args.output, sheets)
+        print(f"  CSV bundle: {bundle_dir}/")
 
     # Summary stats to stdout
     print(f"\n{'=' * 60}")

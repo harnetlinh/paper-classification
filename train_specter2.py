@@ -263,6 +263,13 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
         revision=getattr(config, "BACKBONE_REVISION", None),
     ).to(device)
 
+    # Print the rich-features flag prominently — eval/inference need to be run
+    # with the SAME flag value as training, otherwise the model sees a different
+    # input format and predictions degrade silently.
+    rich = bool(getattr(config, "USE_RICH_FEATURES", False))
+    print(f"  Rich features (Author Keywords + Source title + Document type): "
+          f"{'ON' if rich else 'OFF'} — eval/inference must match this flag")
+
     # Loss
     if target_type == "multi_label":
         class_weights = utils.compute_class_weights(train_df, target_cols).to(device)

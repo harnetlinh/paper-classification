@@ -117,12 +117,10 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
     if thresholds is None or len(thresholds) != n_classes:
         thresholds = [0.5] * n_classes
     
-    # Tokenize inputs
+    # Tokenize inputs — use the shared builder so train/eval/inference all see
+    # the exact same input format (rich features when config flag is on).
     sep = tokenizer.sep_token
-    texts = [
-        (str(t).strip() + sep + str(a).strip())
-        for t, a in zip(df["Title"], df["Abstract"])
-    ]
+    texts = utils.build_input_texts(df, sep)
     enc = tokenizer(
         texts,
         padding="max_length",

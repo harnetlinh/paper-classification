@@ -106,6 +106,18 @@ SPECTER2_ADAPTER = "allenai/specter2_classification"
 MAX_LENGTH = 512
 DROPOUT = 0.2   # Slightly higher than the previous 0.1 to combat overfit on small data.
 
+# Rich features: enrich the [SEP]-separated input with metadata columns from
+# the source Excel beyond Title + Abstract. The signals are:
+#   - Author Keywords : ~90 chars/paper, often near-direct topic markers
+#                       (e.g. "INTERNATIONAL STUDENTS" → International edu)
+#   - Source title    : journal name — strong topic prior
+#   - Document type   : ARTICLE / REVIEW / BOOK CHAPTER — strong Method prior
+# Coverage on the 2024 test set: Author Keywords 89%, Source title 100%,
+# Document type 100%. These are expert-supplied / publisher-supplied signals
+# the original pipeline was throwing away.
+# Set to False for the legacy Title+Abstract-only behaviour.
+USE_RICH_FEATURES = True
+
 # When switching backbone, batch size may need to drop to fit in T4 16GB:
 #   specter2_base / e5-base / deberta-v3-base : batch 32 OK
 #   e5-large / deberta-v3-large               : drop to batch 16
