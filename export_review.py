@@ -215,6 +215,13 @@ def build_summary_rows(df, fields_probs, levels_probs, method_probs,
             "Year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
             "Title": _truncate(row.get("Title", ""), 200),
             "Abstract_excerpt": _truncate(row.get("Abstract", ""), abstract_chars),
+            # Rich-feature metadata the model also sees during inference. Surfaced
+            # here so the human reviewer can sanity-check what context the model
+            # used (matters when machine and human labels disagree — sometimes
+            # the keywords reveal the intent that the abstract obscures).
+            "Author_Keywords": _truncate(str(row.get("Author Keywords", "") or ""), 200),
+            "Source_title": _truncate(str(row.get("Source title", "") or ""), 100),
+            "Document_type": str(row.get("Document type", "") or ""),
             "Fields_human": "; ".join(sorted(fh)),
             "Fields_machine": "; ".join(sorted(fm)),
             "Fields_missing_in_machine": "; ".join(sorted(f_missed)),

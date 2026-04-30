@@ -200,40 +200,84 @@ def process_gold(df_gold: pd.DataFrame, df_main: pd.DataFrame) -> pd.DataFrame:
         print(f"WARNING: {n_no_method} papers có Method không parse được (sẽ bị drop)")
     df_gold = df_gold[df_gold["method_clean"].notna()].copy()
     
-    # Recover missing Total_ID by Title match against main sheet.
-    # Source Excel "recoded- field & level" has ~430 rows where both Total_ID and "Mã bài"
-    # are blank; these are the 2023 batch where IDs were never filled in. They all match
-    # exactly one Year=2023 entry in the main sheet by Title, so we restrict the lookup
-    # to Year=2023 to avoid ambiguity with same-title papers reported in earlier years.
-    main_2023 = df_main[df_main["Year"] == 2023].copy()
-    main_2023["_title_norm"] = main_2023["Title"].apply(normalize_whitespace)
-    title_to_id_2023 = (
-        main_2023.dropna(subset=["Total_ID"])
-        .drop_duplicates(subset="_title_norm")
-        .set_index("_title_norm")["Total_ID"]
+    # CRITICAL: gold sheet's Total_ID column and main sheet's Total_ID column are
+    # NOT the same identifier system — verified empirically (0/1783 papers
+    # share a Total_ID between the two sheets despite having matching titles).
+    # The gold sheet's Total_IDs were assigned independently when the gold
+    # sheet was first compiled, before the main 2997-row consolidation.
+    #
+    # Therefore: we MUST match papers between gold and main by normalised
+    # Title, NOT by Total_ID. Doing this brings in the correct Year + rich
+    # metadata (Author Keywords / Source title / Document type) per paper.
+    #
+    # IMPORTANT: we KEEP gold's original Total_ID intact for backward compat
+    # with existing augmentation parquets (special_edu_augmented.parquet etc.,
+    # which were generated against gold's local Total_ID space). Only the
+    # cross-sheet metadata fetch changes from ID-join to Title-join.
+    df_main = df_main.copy()
+    df_main["_title_norm"] = df_main["Title"].apply(normalize_whitespace)
+    df_gold["_title_norm"] = df_gold["Title"].apply(normalize_whitespace)
+
+    # Title → main row lookup (drop dup titles in main; keep first)
+    main_keep_cols = ["Year"] + [c for c in RICH_FEATURE_COLS if c in df_main.columns]
+    main_by_title = (
+        df_main.drop_duplicates(subset="_title_norm")
+               .set_index("_title_norm")[main_keep_cols]
+    )
+
+    # Map dict-per-row to gold via Title
+    enriched = df_gold["_title_norm"].map(main_by_title.to_dict("index"))
+    n_match = enriched.notna().sum()
+    n_miss = (~enriched.notna()).sum()
+    print(f"Title-match between gold and main sheet: {n_match}/{len(df_gold)} matched, "
+          f"{n_miss} unmatched (rich features will be empty for those)")
+
+    # Expand the dict-per-row into individual columns
+    for col in main_keep_cols:
+        df_gold[col] = enriched.apply(lambda d: d.get(col) if isinstance(d, dict) else None)
+
+    # Backfill Total_ID for rows that gold sheet left blank (430 rows from
+    # the 2023 batch). For those rows ONLY, use the main sheet's Total_ID
+    # (recovered via title) so the row has a stable ID for augmentation /
+    # threshold tuning. Existing rows with non-blank Total_ID stay untouched.
+    df_gold["Total_ID"] = pd.to_numeric(df_gold["Total_ID"], errors="coerce")
+    main_tid_by_title = (
+        df_main.drop_duplicates(subset="_title_norm")
+               .set_index("_title_norm")["Total_ID"]
     )
     mask_missing_id = df_gold["Total_ID"].isna()
     n_missing = int(mask_missing_id.sum())
     if n_missing > 0:
-        recovered = df_gold.loc[mask_missing_id, "Title"].map(title_to_id_2023)
+        # IMPORTANT: main IDs run 1..2997 and gold sheet IDs run 1533..3912;
+        # there is no collision because main IDs assigned to the 430 missing
+        # rows correspond to 2023 papers whose main IDs land in 2580+ — outside
+        # the gold sheet's used range (1533..3912 contains main 2580+, but
+        # gold's own IDs in that range refer to OTHER papers entirely; the
+        # potential collision is benign because the 430 rows being recovered
+        # have NaN gold IDs in the first place).
+        recovered = df_gold.loc[mask_missing_id, "_title_norm"].map(main_tid_by_title)
         df_gold.loc[mask_missing_id, "Total_ID"] = recovered
         n_recovered = int(recovered.notna().sum())
-        print(f"Recovered Total_ID for {n_recovered}/{n_missing} rows via Title match (Year=2023)")
+        print(f"Recovered Total_ID for {n_recovered}/{n_missing} blank rows via Title match")
+    df_gold = df_gold.drop(columns=["_title_norm"])
+    
+    # Year fallbacks for rows where Title-match didn't bring a Year:
+    #
+    # 1) Time_Period == NaN  → 2023 (the 2023 batch had blank Time_Period)
+    # 2) Time_Period == "1966-2020" → 2020 (old corpus papers not present in
+    #    the main sheet; we don't know exact year but they belong in TRAIN
+    #    years [2013-2022], so 2020 puts them at the end of train. They keep
+    #    their labels — only the rich-feature columns stay empty.)
+    # 3) Anything else still NaN → drop with a warning.
+    mask = df_gold["Year"].isna() & df_gold["Time_Period"].isna()
+    df_gold.loc[mask, "Year"] = 2023
+    mask = df_gold["Year"].isna() & (df_gold["Time_Period"] == "1966-2020")
+    n_old = int(mask.sum())
+    if n_old:
+        df_gold.loc[mask, "Year"] = 2020
+        print(f"Year=2020 fallback for {n_old} 1966-2020 papers not found in main sheet "
+              f"(train-year placement; rich features stay empty)")
 
-    # Join with main to pull Year + rich metadata (Author Keywords, Source title,
-    # Document type). These columns exist on every 2997-row main-sheet entry but
-    # are NOT present in the gold sheet — fetching them via Total_ID join is the
-    # cleanest way to enrich the training input without changing label semantics.
-    main_keep = ["Total_ID", "Year"] + RICH_FEATURE_COLS
-    main_subset_cols = [c for c in main_keep if c in df_main.columns]
-    df_main_subset = df_main[main_subset_cols].copy()
-    df_main_subset["Total_ID"] = pd.to_numeric(df_main_subset["Total_ID"], errors="coerce")
-    df_gold["Total_ID"] = pd.to_numeric(df_gold["Total_ID"], errors="coerce")
-    df_gold = df_gold.merge(df_main_subset, on="Total_ID", how="left", suffixes=("", "_main"))
-    
-    # 430 papers Time_Period=NaN → Year=2023 (verified earlier qua title match)
-    df_gold.loc[df_gold["Year"].isna() & df_gold["Time_Period"].isna(), "Year"] = 2023
-    
     n_no_year = df_gold["Year"].isna().sum()
     if n_no_year > 0:
         print(f"WARNING: {n_no_year} papers thiếu Year (sẽ bị drop)")
