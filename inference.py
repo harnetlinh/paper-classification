@@ -135,9 +135,9 @@ def predict_task(df: pd.DataFrame, task: str, device, tokenizer):
     n = len(df)
     all_probs = []
     with torch.no_grad():
-        for i in tqdm(range(0, n, config.BATCH_SIZE), desc=f"{task} inference"):
-            batch_ids = enc["input_ids"][i:i+config.BATCH_SIZE].to(device)
-            batch_mask = enc["attention_mask"][i:i+config.BATCH_SIZE].to(device)
+        for i in tqdm(range(0, n, config.effective_batch_size()), desc=f"{task} inference"):
+            batch_ids = enc["input_ids"][i:i+config.effective_batch_size()].to(device)
+            batch_mask = enc["attention_mask"][i:i+config.effective_batch_size()].to(device)
             sum_probs = None
             for m in models:
                 logits = m(batch_ids, batch_mask)

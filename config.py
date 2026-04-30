@@ -109,9 +109,28 @@ DROPOUT = 0.2   # Slightly higher than the previous 0.1 to combat overfit on sma
 # When switching backbone, batch size may need to drop to fit in T4 16GB:
 #   specter2_base / e5-base / deberta-v3-base : batch 32 OK
 #   e5-large / deberta-v3-large               : drop to batch 16
-# Set to None to use the global BATCH_SIZE; or override per-task:
-#   BACKBONE_BATCH_SIZE = {"intfloat/multilingual-e5-large": 16}
-BACKBONE_BATCH_SIZE = None
+# Set to None to use the global BATCH_SIZE; or override per-backbone:
+#   BACKBONE_BATCH_SIZE = {"intfloat/multilingual-e5-large": 16,
+#                          "microsoft/deberta-v3-large": 16}
+BACKBONE_BATCH_SIZE = {
+    "intfloat/multilingual-e5-large": 16,
+    "microsoft/deberta-v3-large": 16,
+}
+
+
+def effective_batch_size():
+    """Return the actual batch size for the current backbone.
+
+    Looks up BACKBONE_BATCH_SIZE for a per-model override, otherwise falls back
+    to the global BATCH_SIZE. All training / eval / inference call sites should
+    use this instead of `BATCH_SIZE` directly so they respect per-backbone caps.
+    """
+    overrides = BACKBONE_BATCH_SIZE
+    if isinstance(overrides, dict) and BACKBONE_MODEL in overrides:
+        return overrides[BACKBONE_MODEL]
+    if isinstance(overrides, int):
+        return overrides
+    return BATCH_SIZE
 
 # ==================== TRAINING CONFIG ====================
 # CPU and GPU need different defaults. The torch.cuda.is_available() probe at

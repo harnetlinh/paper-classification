@@ -124,9 +124,9 @@ def predict_split(df: pd.DataFrame, task: str, device, tokenizer):
 
         all_probs = []
         with torch.no_grad():
-            for i in range(0, n, config.BATCH_SIZE):
-                ids = enc["input_ids"][i:i+config.BATCH_SIZE].to(device)
-                msk = enc["attention_mask"][i:i+config.BATCH_SIZE].to(device)
+            for i in range(0, n, config.effective_batch_size()):
+                ids = enc["input_ids"][i:i+config.effective_batch_size()].to(device)
+                msk = enc["attention_mask"][i:i+config.effective_batch_size()].to(device)
                 logits = model(ids, msk)
                 if target_type == "multi_label":
                     p = torch.sigmoid(logits).cpu().numpy()

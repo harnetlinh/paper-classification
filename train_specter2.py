@@ -248,7 +248,7 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
         max_length=config.MAX_LENGTH,
     )
     
-    batch_size = 4 if smoke else config.BATCH_SIZE
+    batch_size = 4 if smoke else config.effective_batch_size()
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         generator=torch.Generator().manual_seed(config.SEED),
@@ -508,7 +508,7 @@ def build_ensemble(task: str):
         val_df, tokenizer, target_cols=target_cols, target_type=target_type,
         method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
     )
-    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=config.effective_batch_size(), shuffle=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Aggregate probabilities across seeds

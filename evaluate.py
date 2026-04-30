@@ -279,7 +279,7 @@ def evaluate_task(task: str, device, val_loader, test_loader,
     if use_tta:
         val_loaders = _tta_loaders(
             val_df, tokenizer, target_cols, target_type, method_to_idx,
-            config.MAX_LENGTH, config.BATCH_SIZE,
+            config.MAX_LENGTH, config.effective_batch_size(),
         )
         print(f"  TTA variants on val: {[v for v, _ in val_loaders]}")
         val_probs, val_targets = _ensemble_predict_with_tta(
@@ -296,7 +296,7 @@ def evaluate_task(task: str, device, val_loader, test_loader,
         if use_tta and test_df is not None:
             test_loaders = _tta_loaders(
                 test_df, tokenizer, target_cols, target_type, method_to_idx,
-                config.MAX_LENGTH, config.BATCH_SIZE,
+                config.MAX_LENGTH, config.effective_batch_size(),
             )
             print(f"  TTA variants on test: {[v for v, _ in test_loaders]}")
             test_probs, test_targets = _ensemble_predict_with_tta(
@@ -484,7 +484,7 @@ def build_loaders(task: str):
         target_cols=target_cols, target_type=target_type,
         method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
     )
-    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=config.effective_batch_size(), shuffle=False)
     
     test_loader = None
     if len(test_df) > 0:
@@ -493,7 +493,7 @@ def build_loaders(task: str):
             target_cols=target_cols, target_type=target_type,
             method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
         )
-        test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=config.effective_batch_size(), shuffle=False)
     
     return val_loader, test_loader, target_type, n_classes
 
@@ -531,7 +531,7 @@ def main():
             target_cols=inputs["target_cols"], target_type=inputs["target_type"],
             method_to_idx=inputs["method_to_idx"], max_length=config.MAX_LENGTH,
         )
-        val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+        val_loader = DataLoader(val_ds, batch_size=config.effective_batch_size(), shuffle=False)
         test_loader = None
         if len(inputs["test_df"]) > 0:
             test_ds = utils.PaperDataset(
@@ -539,7 +539,7 @@ def main():
                 target_cols=inputs["target_cols"], target_type=inputs["target_type"],
                 method_to_idx=inputs["method_to_idx"], max_length=config.MAX_LENGTH,
             )
-            test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+            test_loader = DataLoader(test_ds, batch_size=config.effective_batch_size(), shuffle=False)
         report = evaluate_task(
             task, device, val_loader, test_loader,
             inputs["target_type"], inputs["n_classes"],

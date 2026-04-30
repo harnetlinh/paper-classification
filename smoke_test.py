@@ -330,7 +330,7 @@ def test_phase_2():
         # Mock tokenizer behavior — we just need the encoding shape to be right
         # Skip if internet unavailable; trust that SPECTER2 tokenizer works
         try:
-            tok = AutoTokenizer.from_pretrained("allenai/specter2_base")
+            tok = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
         except Exception:
             print("    (Skipped — no internet access for tokenizer download)")
             return
