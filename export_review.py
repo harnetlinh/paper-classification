@@ -1,0 +1,536 @@
+"""
+Phase 4b: Export human-review workbook (machine vs human classification).
+
+Builds a multi-sheet Excel workbook comparing machine predictions against
+gold/human labels on val 2023 and test 2024 splits, sorted by disagreement
+severity so a human reviewer can prioritize where to look.
+
+Sheets:
+- summary:           1 row/paper, all 3 tasks side-by-side, missing/extra
+                     labels broken out, jaccard similarity per task,
+                     review_priority for sorting.
+- disagreements:     same shape as summary, but filtered to papers where the
+                     machine and human disagree on at least one task.
+- fields_proba:      per-class human/pred/probability for the Fields task.
+- levels_proba:      same, 6 levels.
+- method_proba:      single-label argmax probabilities + softmax over 5 methods.
+- stats:             per-class precision / recall / F1 / support over the
+                     selected split (default test_2024).
+- legend:            short column-by-column glossary for reviewer onboarding.
+
+Auto-detects ensemble checkpoints (`model_{task}_s{seed}.pt`). Loads tuned
+thresholds from `thresholds_{task}.json` if present, else falls back to 0.5.
+
+Usage:
+    python export_review.py
+    python export_review.py --output outputs/review.xlsx
+    python export_review.py --split test     # only test 2024
+    python export_review.py --abstract-chars 500
+"""
+import argparse
+import json
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+import config
+import utils
+from train_specter2 import (
+    SpecterClassifier, get_target_cols, get_class_names, load_train_val_test,
+    _model_save_path,
+)
+
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ==================== Loaders ====================
+def list_seed_models(task: str):
+    """Return [(seed, path), ...] for every seed checkpoint that exists."""
+    seeds = [config.SEED] + [
+        s for s in getattr(config, "ENSEMBLE_SEEDS", []) if s != config.SEED
+    ]
+    found = []
+    for seed in seeds:
+        p = _model_save_path(task, seed)
+        if p.exists():
+            found.append((seed, p))
+    return found
+
+
+def load_thresholds(task: str, n_classes: int):
+    """Load tuned thresholds; fallback to 0.5 if missing/wrong-shape."""
+    if task == "method":
+        return None   # single-label uses argmax
+    path = config.threshold_path(task)
+    if not path.exists():
+        return [0.5] * n_classes
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    th = data.get("thresholds")
+    if th is None or len(th) != n_classes:
+        return [0.5] * n_classes
+    return th
+
+
+def predict_split(df: pd.DataFrame, task: str, device, tokenizer):
+    """Predict probabilities for a split using ensemble (if available).
+
+    Returns:
+        probs: ndarray [N, C]
+        target_type: 'multi_label' | 'single_label'
+        n_classes: int
+    """
+    if task in ("fields", "levels"):
+        target_cols = get_target_cols(task)
+        n_classes = len(target_cols)
+        target_type = "multi_label"
+    else:
+        target_cols = None
+        n_classes = len(config.METHODS_5)
+        target_type = "single_label"
+
+    seed_models = list_seed_models(task)
+    if not seed_models:
+        raise FileNotFoundError(
+            f"No checkpoint for task={task}. Run train_specter2.py --task {task} first."
+        )
+
+    # Pre-tokenize once
+    sep = tokenizer.sep_token
+    texts = [
+        (str(t).strip() + sep + str(a).strip())
+        for t, a in zip(df["Title"], df["Abstract"])
+    ]
+    enc = tokenizer(
+        texts, padding="max_length", truncation=True,
+        max_length=config.MAX_LENGTH, return_tensors="pt",
+    )
+
+    n = len(df)
+    sum_probs = None
+    for seed, path in seed_models:
+        model = SpecterClassifier(
+            config.SPECTER2_BASE, n_classes=n_classes,
+            dropout=getattr(config, "DROPOUT", 0.1),
+            revision=getattr(config, "SPECTER2_REVISION", None),
+        ).to(device)
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.eval()
+
+        all_probs = []
+        with torch.no_grad():
+            for i in range(0, n, config.BATCH_SIZE):
+                ids = enc["input_ids"][i:i+config.BATCH_SIZE].to(device)
+                msk = enc["attention_mask"][i:i+config.BATCH_SIZE].to(device)
+                logits = model(ids, msk)
+                if target_type == "multi_label":
+                    p = torch.sigmoid(logits).cpu().numpy()
+                else:
+                    p = torch.softmax(logits, dim=-1).cpu().numpy()
+                all_probs.append(p)
+        seed_probs = np.concatenate(all_probs)
+        sum_probs = seed_probs if sum_probs is None else sum_probs + seed_probs
+
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    avg_probs = sum_probs / len(seed_models)
+    return avg_probs, target_type, n_classes, len(seed_models)
+
+
+# ==================== Builders ====================
+def _truncate(s, n):
+    if not isinstance(s, str):
+        return ""
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def _safe_list(v):
+    """Coerce a parquet list-cell (Python list, numpy array, or None) to a list.
+
+    Pandas/parquet round-trips list-of-strings as numpy arrays, which break
+    `or []` truth-value checks. This helper is the canonical way to normalise.
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    try:
+        return list(v)
+    except TypeError:
+        return []
+
+
+def build_summary_rows(df, fields_probs, levels_probs, method_probs,
+                        fields_thr, levels_thr, abstract_chars: int):
+    """Build summary rows with per-task human/machine label sets."""
+    fields_names = config.FIELDS_12
+    levels_names = config.LEVELS_6
+    methods_names = config.METHODS_5
+
+    fields_pred = (fields_probs >= np.array(fields_thr)[None, :]).astype(int)
+    levels_pred = (levels_probs >= np.array(levels_thr)[None, :]).astype(int)
+    method_pred = method_probs.argmax(axis=1)
+    method_conf = method_probs.max(axis=1)
+
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        # --- Fields ---
+        fh = set(_safe_list(row.get("fields_list")))
+        fm = {fields_names[c] for c in range(len(fields_names)) if fields_pred[i, c] == 1}
+        f_missed = fh - fm
+        f_extra = fm - fh
+        f_inter = fh & fm
+        f_union = fh | fm
+        f_jacc = (len(f_inter) / len(f_union)) if f_union else 1.0
+        f_disagree = len(f_missed) + len(f_extra)
+
+        # --- Levels ---
+        lh = set(_safe_list(row.get("levels_list")))
+        lm = {levels_names[c] for c in range(len(levels_names)) if levels_pred[i, c] == 1}
+        l_missed = lh - lm
+        l_extra = lm - lh
+        l_inter = lh & lm
+        l_union = lh | lm
+        l_jacc = (len(l_inter) / len(l_union)) if l_union else 1.0
+        l_disagree = len(l_missed) + len(l_extra)
+
+        # --- Method ---
+        mh = row.get("method", "")
+        mm = methods_names[method_pred[i]]
+        method_match = (mh == mm)
+        m_disagree = 0 if method_match else 1
+
+        total_disagree = f_disagree + l_disagree + m_disagree
+        # priority: HIGH if all 3 disagree, MED if 2, LOW if 1, OK if 0
+        n_tasks_disagree = (1 if f_disagree else 0) + (1 if l_disagree else 0) + (1 if m_disagree else 0)
+        priority = ["OK", "LOW", "MEDIUM", "HIGH"][n_tasks_disagree]
+
+        rows.append({
+            "Total_ID": int(row["Total_ID"]) if pd.notna(row.get("Total_ID")) else None,
+            "Year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+            "Title": _truncate(row.get("Title", ""), 200),
+            "Abstract_excerpt": _truncate(row.get("Abstract", ""), abstract_chars),
+            "Fields_human": "; ".join(sorted(fh)),
+            "Fields_machine": "; ".join(sorted(fm)),
+            "Fields_missing_in_machine": "; ".join(sorted(f_missed)),
+            "Fields_extra_in_machine": "; ".join(sorted(f_extra)),
+            "Fields_jaccard": round(f_jacc, 3),
+            "Fields_disagreement": f_disagree,
+            "Levels_human": "; ".join(sorted(lh)),
+            "Levels_machine": "; ".join(sorted(lm)),
+            "Levels_missing_in_machine": "; ".join(sorted(l_missed)),
+            "Levels_extra_in_machine": "; ".join(sorted(l_extra)),
+            "Levels_jaccard": round(l_jacc, 3),
+            "Levels_disagreement": l_disagree,
+            "Method_human": str(mh),
+            "Method_machine": str(mm),
+            "Method_confidence": round(float(method_conf[i]), 3),
+            "Method_match": method_match,
+            "review_priority": priority,
+            "total_disagreements": total_disagree,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_proba_rows(df, probs, thresholds, class_names, prefix=""):
+    """Build per-class probability sheet for a multi-label task.
+
+    Columns per class: {class}_human, {class}_pred, {class}_prob, {class}_status
+    where status is TP/FP/FN/TN — lets reviewers filter by error type.
+    """
+    targets = np.zeros((len(df), len(class_names)), dtype=int)
+    for i, (_, row) in enumerate(df.iterrows()):
+        col = f"{prefix}_list" if prefix else "fields_list"
+        labels = set(_safe_list(row.get(col)))
+        for c, name in enumerate(class_names):
+            if name in labels:
+                targets[i, c] = 1
+
+    pred = (probs >= np.array(thresholds)[None, :]).astype(int)
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        item = {
+            "Total_ID": int(row["Total_ID"]) if pd.notna(row.get("Total_ID")) else None,
+            "Year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+            "Title": _truncate(row.get("Title", ""), 120),
+        }
+        n_disagree = 0
+        for c, name in enumerate(class_names):
+            h, p, prob = int(targets[i, c]), int(pred[i, c]), float(probs[i, c])
+            if h == 1 and p == 1:
+                status = "TP"
+            elif h == 0 and p == 1:
+                status = "FP"
+                n_disagree += 1
+            elif h == 1 and p == 0:
+                status = "FN"
+                n_disagree += 1
+            else:
+                status = "TN"
+            item[f"{name}__human"] = h
+            item[f"{name}__pred"] = p
+            item[f"{name}__prob"] = round(prob, 3)
+            item[f"{name}__status"] = status
+        item["disagreements"] = n_disagree
+        rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def build_method_proba_rows(df, probs):
+    """Per-paper softmax probabilities over 5 methods + match status."""
+    method_pred = probs.argmax(axis=1)
+    method_conf = probs.max(axis=1)
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        mh = row.get("method", "")
+        mm = config.METHODS_5[method_pred[i]]
+        item = {
+            "Total_ID": int(row["Total_ID"]) if pd.notna(row.get("Total_ID")) else None,
+            "Year": int(row["Year"]) if pd.notna(row.get("Year")) else None,
+            "Title": _truncate(row.get("Title", ""), 120),
+            "Method_human": str(mh),
+            "Method_machine": str(mm),
+            "Method_match": (mh == mm),
+            "Method_confidence": round(float(method_conf[i]), 3),
+        }
+        for c, name in enumerate(config.METHODS_5):
+            item[f"prob_{name}"] = round(float(probs[i, c]), 3)
+        rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def build_per_class_stats(df, probs, thresholds, class_names, target_type, prefix=""):
+    """Compute precision / recall / F1 / support per class."""
+    from sklearn.metrics import precision_recall_fscore_support
+
+    if target_type == "multi_label":
+        col = f"{prefix}_list" if prefix else "fields_list"
+        targets = np.zeros((len(df), len(class_names)), dtype=int)
+        for i, (_, row) in enumerate(df.iterrows()):
+            labels = set(_safe_list(row.get(col)))
+            for c, name in enumerate(class_names):
+                if name in labels:
+                    targets[i, c] = 1
+        preds = (probs >= np.array(thresholds)[None, :]).astype(int)
+        p, r, f, s = precision_recall_fscore_support(
+            targets, preds, average=None, zero_division=0,
+        )
+        rows = []
+        for c, name in enumerate(class_names):
+            rows.append({
+                "class": name,
+                "support_human": int(s[c]),
+                "support_predicted": int(preds[:, c].sum()),
+                "true_positive": int(((targets[:, c] == 1) & (preds[:, c] == 1)).sum()),
+                "false_positive": int(((targets[:, c] == 0) & (preds[:, c] == 1)).sum()),
+                "false_negative": int(((targets[:, c] == 1) & (preds[:, c] == 0)).sum()),
+                "precision": round(float(p[c]), 4),
+                "recall": round(float(r[c]), 4),
+                "f1": round(float(f[c]), 4),
+                "threshold": round(float(thresholds[c]), 3),
+            })
+        return pd.DataFrame(rows)
+    # single-label
+    targets = np.array([config.METHODS_5.index(m) if m in config.METHODS_5 else -1
+                         for m in df["method"]])
+    preds = probs.argmax(axis=1)
+    p, r, f, s = precision_recall_fscore_support(
+        targets, preds, average=None, zero_division=0,
+        labels=list(range(len(class_names))),
+    )
+    rows = []
+    for c, name in enumerate(class_names):
+        rows.append({
+            "class": name,
+            "support_human": int(s[c]),
+            "support_predicted": int((preds == c).sum()),
+            "precision": round(float(p[c]), 4),
+            "recall": round(float(r[c]), 4),
+            "f1": round(float(f[c]), 4),
+        })
+    return pd.DataFrame(rows)
+
+
+# ==================== Excel writer ====================
+LEGEND_ROWS = [
+    ("Total_ID", "Paper identifier from the original Excel main sheet."),
+    ("Year", "Publication year."),
+    ("Title / Abstract_excerpt", "First 200 / N chars (configurable via --abstract-chars)."),
+    ("Fields_human", "Human-curated multi-label Fields (semicolon list)."),
+    ("Fields_machine", "Model-predicted Fields after threshold tuning."),
+    ("Fields_missing_in_machine", "Labels human assigned that the model missed (false negatives)."),
+    ("Fields_extra_in_machine", "Labels the model added that the human did not (false positives)."),
+    ("Fields_jaccard", "Set similarity between human and machine label sets (1.0 = perfect)."),
+    ("Levels_*", "Same fields applied to the 6-level taxonomy."),
+    ("Method_human / Method_machine", "Single-label method (Quantitative/Qualitative/Mixed/Review/Other)."),
+    ("Method_confidence", "Softmax probability of the predicted method."),
+    ("review_priority", "HIGH = all 3 tasks disagree; MEDIUM = 2; LOW = 1; OK = perfect agreement."),
+    ("total_disagreements", "Sum of FP+FN across Fields/Levels + (1 if method mismatch). Higher = needs more review."),
+    ("status (per-class)", "TP=both label, FP=machine only, FN=human only, TN=neither."),
+    ("threshold", "Per-class probability cutoff used for the binary prediction (tuned on val 2023)."),
+    ("Notes", "Sheet 'disagreements' is a filtered copy of 'summary_*' — same data, easier to scan."),
+]
+
+
+def write_workbook(output_path, sheets):
+    """Write the {sheet_name: dataframe} dict to Excel + apply minimal formatting."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    # Post-process for column widths + freeze pane
+    from openpyxl import load_workbook
+    wb = load_workbook(output_path)
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        # auto-fit-ish column widths
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col[:200]:   # sample first 200 rows
+                v = cell.value
+                if v is not None:
+                    max_len = max(max_len, min(60, len(str(v))))
+            ws.column_dimensions[col_letter].width = max(8, min(60, max_len + 2))
+    wb.save(output_path)
+
+
+# ==================== Main ====================
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default=str(config.OUTPUT_DIR / "review.xlsx"),
+                        help="Output Excel path")
+    parser.add_argument("--split", choices=["all", "val", "test"], default="all",
+                        help="Which split(s) to export (default: all)")
+    parser.add_argument("--abstract-chars", type=int, default=300,
+                        help="Truncate abstract to N chars in output (default 300)")
+    args = parser.parse_args()
+
+    # Validate trained models
+    missing = [t for t in ["fields", "levels", "method"] if not list_seed_models(t)]
+    if missing:
+        print(f"ERROR: trained models missing for: {missing}")
+        print("Run: python train_specter2.py --task all   (or --ensemble for multi-seed)")
+        return 1
+
+    print("Loading data...")
+    if not config.GOLD_PARQUET.exists() or not config.MAIN_2024_PARQUET.exists():
+        print("ERROR: parquet files missing. Run sanitize.py first.")
+        return 1
+    # Load raw (un-augmented) labels — augmentation labels were synthesised by
+    # the LLM ensemble, the human reviewer wants to compare model output
+    # against the human-curated truth, not against the LLM agreement.
+    raw_gold = pd.read_parquet(config.GOLD_PARQUET)
+    val_df_raw = raw_gold[raw_gold["Year"] == config.VAL_YEAR].copy().reset_index(drop=True)
+    test_df_raw = pd.read_parquet(config.MAIN_2024_PARQUET).copy().reset_index(drop=True)
+
+    splits = []
+    if args.split in ("all", "val"):
+        splits.append(("val_2023", val_df_raw))
+    if args.split in ("all", "test"):
+        splits.append(("test_2024", test_df_raw))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.SPECTER2_BASE)
+
+    sheets = {}
+
+    # Predict each split × each task once
+    cache = {}
+    for split_name, df in splits:
+        print(f"\nPredicting {split_name} (n={len(df)})...")
+        for task in ["fields", "levels", "method"]:
+            print(f"  - {task}", end=" ")
+            probs, target_type, n_classes, n_models = predict_split(df, task, device, tokenizer)
+            cache[(split_name, task)] = (probs, target_type, n_classes, n_models)
+            print(f"({n_models} model{'s' if n_models > 1 else ''})")
+
+    # Build sheets per split
+    for split_name, df in splits:
+        fields_probs = cache[(split_name, "fields")][0]
+        levels_probs = cache[(split_name, "levels")][0]
+        method_probs = cache[(split_name, "method")][0]
+        fields_thr = load_thresholds("fields", len(config.FIELDS_12))
+        levels_thr = load_thresholds("levels", len(config.LEVELS_6))
+
+        summary = build_summary_rows(
+            df, fields_probs, levels_probs, method_probs,
+            fields_thr, levels_thr, args.abstract_chars,
+        )
+        # Sort: HIGH disagreement first, then MEDIUM, LOW, OK; tie-break by total_disagreements desc
+        priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "OK": 3}
+        summary["_p"] = summary["review_priority"].map(priority_order)
+        summary = summary.sort_values(
+            by=["_p", "total_disagreements"], ascending=[True, False]
+        ).drop(columns=["_p"]).reset_index(drop=True)
+
+        sheets[f"summary_{split_name}"] = summary
+        # Multi-label tasks rarely achieve full label-set agreement (12 fields ×
+        # 6 levels means many ways to disagree), so "any disagreement" filters
+        # almost nothing useful. The high-priority view focuses on papers where
+        # the model disagrees on ALL THREE task types — that's the human review
+        # backlog worth prioritising.
+        sheets[f"disagreements_{split_name}"] = summary[
+            summary["review_priority"] == "HIGH"
+        ].reset_index(drop=True)
+        # And a "needs major review" sheet: total disagreements >= 4 (cumulative
+        # FP+FN across tasks + method mismatch). Catches cases where 1-2 tasks
+        # are wrong by a lot, which the priority bucketing alone doesn't surface.
+        sheets[f"major_disagreements_{split_name}"] = summary[
+            summary["total_disagreements"] >= 4
+        ].reset_index(drop=True)
+        sheets[f"fields_{split_name}"] = build_proba_rows(
+            df, fields_probs, fields_thr, config.FIELDS_12, prefix="fields",
+        )
+        sheets[f"levels_{split_name}"] = build_proba_rows(
+            df, levels_probs, levels_thr, config.LEVELS_6, prefix="levels",
+        )
+        sheets[f"method_{split_name}"] = build_method_proba_rows(df, method_probs)
+        sheets[f"stats_{split_name}_fields"] = build_per_class_stats(
+            df, fields_probs, fields_thr, config.FIELDS_12, "multi_label", prefix="fields",
+        )
+        sheets[f"stats_{split_name}_levels"] = build_per_class_stats(
+            df, levels_probs, levels_thr, config.LEVELS_6, "multi_label", prefix="levels",
+        )
+        sheets[f"stats_{split_name}_method"] = build_per_class_stats(
+            df, method_probs, None, config.METHODS_5, "single_label",
+        )
+
+    # Legend
+    sheets["legend"] = pd.DataFrame(LEGEND_ROWS, columns=["column", "meaning"])
+
+    print(f"\nWriting {args.output}...")
+    write_workbook(args.output, sheets)
+
+    # Summary stats to stdout
+    print(f"\n{'=' * 60}")
+    print("Export complete.")
+    print(f"{'=' * 60}")
+    print(f"  Output: {args.output}")
+    for split_name, _ in splits:
+        s = sheets[f"summary_{split_name}"]
+        n_total = len(s)
+        n_high = (s["review_priority"] == "HIGH").sum()
+        n_med = (s["review_priority"] == "MEDIUM").sum()
+        n_low = (s["review_priority"] == "LOW").sum()
+        n_ok = (s["review_priority"] == "OK").sum()
+        print(f"\n  {split_name}: {n_total} papers")
+        print(f"    HIGH (3/3 tasks disagree): {n_high}  ({n_high/n_total*100:.1f}%)")
+        print(f"    MEDIUM (2/3):              {n_med}  ({n_med/n_total*100:.1f}%)")
+        print(f"    LOW (1/3):                 {n_low}  ({n_low/n_total*100:.1f}%)")
+        print(f"    OK (full agreement):       {n_ok}  ({n_ok/n_total*100:.1f}%)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

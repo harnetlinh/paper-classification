@@ -42,6 +42,12 @@ python train_specter2.py --task all
 # 4. Evaluate
 python evaluate.py --task all
 cat outputs/eval_report.json | python -m json.tool | less
+
+# 5. Export human-review workbook (compare machine vs gold/human labels)
+python export_review.py --output outputs/review.xlsx
+# Open outputs/review.xlsx in Excel — sheet `summary_test_2024` is sorted
+# disagreements-first, sheet `disagreements_test_2024` is filtered to only
+# papers needing human review.
 ```
 
 ## Pipeline tổng quan
@@ -79,11 +85,25 @@ train_specter2.py
 
 evaluate.py
    │
-   ▼ Macro F1, micro F1, macro AUC, macro AP per task
+   ▼ Macro F1, micro F1, weighted F1, macro AUC, macro AP per task
+     + supported_macro_f1 (classes with support ≥ 5) and high_support_macro_f1 (≥ 30)
      + per-class table (val_2023 + test_2024)
      + drift_gap (val − test macro F1)
      + low-support warnings for classes with val support < 5
    └──► outputs/eval_report.json
+
+export_review.py
+   │
+   ▼ Side-by-side machine-vs-human label comparison for human review.
+     Auto-detects ensemble checkpoints. Builds a multi-sheet Excel with:
+     - summary_{split}: 1 row/paper, all 3 tasks side-by-side, Jaccard,
+       review_priority (HIGH/MEDIUM/LOW/OK) sorted disagreements-first
+     - disagreements_{split}: filtered to papers needing review
+     - {fields,levels,method}_{split}: per-class probability + status
+       (TP/FP/FN/TN) so reviewers can filter by error type
+     - stats_{split}_{task}: per-class precision / recall / F1 / support
+     - legend: column glossary
+   └──► outputs/review.xlsx
 ```
 
 ## Cấu trúc
