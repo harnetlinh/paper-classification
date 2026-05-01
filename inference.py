@@ -29,13 +29,22 @@ from sanitize import normalize_whitespace
 
 
 def _list_seed_models(task: str):
-    """Return [(seed, path), ...] for every seed checkpoint that exists."""
+    """Return [(seed, path), ...] for every seed checkpoint that exists.
+
+    Phase F refits (`_trainval` suffix) take precedence over the train→val
+    checkpoint when both exist — they were fit on more data with reused
+    thresholds, so they're strictly the later artifact.
+    """
     seeds_to_try = [config.SEED] + [
         s for s in getattr(config, "ENSEMBLE_SEEDS", []) if s != config.SEED
     ]
     found = []
     for seed in seeds_to_try:
-        p = _model_save_path(task, seed)
+        p_trainval = _model_save_path(task, seed, include_val=True)
+        if p_trainval.exists():
+            found.append((seed, p_trainval))
+            continue
+        p = _model_save_path(task, seed, include_val=False)
         if p.exists():
             found.append((seed, p))
     return found

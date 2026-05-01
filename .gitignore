@@ -29,6 +29,11 @@ outputs/training_log_*.json
 outputs/thresholds_*.json
 outputs/predictions_*.xlsx
 outputs.zip
+outputs/specter2_tapt/
+
+# Phase A/D prediction caches (large, regeneratable)
+outputs/llm_classify/
+outputs/knn_retrieval/
 
 # Keep these (small, semantic):
 !outputs/.gitkeep

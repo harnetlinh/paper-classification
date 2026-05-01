@@ -36,20 +36,38 @@ from train_specter2 import (
     get_target_cols, get_class_names, predict_probs,
     _model_save_path,
 )
+import ensemble
+try:
+    import llm_classify
+    _LLM_CLASSIFY_AVAILABLE = True
+except ImportError:
+    _LLM_CLASSIFY_AVAILABLE = False
+try:
+    import knn_retrieval
+    _KNN_AVAILABLE = True
+except ImportError:
+    _KNN_AVAILABLE = False
 
 
 def _list_seed_models(task: str):
     """Return [(seed, path), ...] for every seed checkpoint that exists.
 
-    Always includes config.SEED (legacy `model_{task}.pt`) plus every additional
-    `ENSEMBLE_SEEDS` entry that has a saved file.
+    Prefers Phase-F `_trainval` checkpoints when present (they're the strictly
+    later, train+val-fitted refits), otherwise falls back to the standard
+    train→val checkpoints. Always includes config.SEED plus every additional
+    ENSEMBLE_SEEDS entry that has a saved file.
     """
     seeds_to_try = [config.SEED] + [
         s for s in getattr(config, "ENSEMBLE_SEEDS", []) if s != config.SEED
     ]
     found = []
     for seed in seeds_to_try:
-        p = _model_save_path(task, seed)
+        # Phase F refits take precedence if both exist.
+        p_trainval = _model_save_path(task, seed, include_val=True)
+        if p_trainval.exists():
+            found.append((seed, p_trainval))
+            continue
+        p = _model_save_path(task, seed, include_val=False)
         if p.exists():
             found.append((seed, p))
     return found
@@ -220,6 +238,41 @@ def evaluate_with_thresholds(probs, targets, target_type, n_classes, thresholds=
     }
 
 
+def _maybe_load_gpt5_panel(split: str, df, n_classes: int, task: str):
+    """If a GPT-5 panel parquet exists for this split, load it and return the
+    [N, n_classes] aligned probabilities for the relevant task; else return None.
+
+    The GPT-5 panel parquet contains predictions for ALL 3 tasks per paper;
+    we extract only the task-relevant block here.
+    """
+    if not _LLM_CLASSIFY_AVAILABLE:
+        return None, 0
+    try:
+        ids, fields_p, levels_p, method_p = llm_classify.load_panel_predictions(split)
+    except FileNotFoundError:
+        return None, 0
+    if task == "fields":
+        panel_probs = fields_p
+    elif task == "levels":
+        panel_probs = levels_p
+    else:  # method
+        panel_probs = method_p
+    aligned, n_match = ensemble.align_gpt5_to_df(df, ids, panel_probs, n_classes)
+    return aligned, n_match
+
+
+def _maybe_load_knn(split: str, df, n_classes: int, task: str):
+    """Load kNN-retrieval soft probs for the split×task if the parquet exists."""
+    if not _KNN_AVAILABLE:
+        return None, 0
+    try:
+        ids, probs = knn_retrieval.load_knn_probs(split, task)
+    except FileNotFoundError:
+        return None, 0
+    aligned, n_match = ensemble.align_gpt5_to_df(df, ids, probs, n_classes)
+    return aligned, n_match
+
+
 def evaluate_task(task: str, device, val_loader, test_loader,
                   target_type: str, n_classes: int,
                   val_df=None, test_df=None, tokenizer=None,
@@ -307,7 +360,86 @@ def evaluate_task(task: str, device, val_loader, test_loader,
         test_metrics = evaluate_with_thresholds(
             test_probs, test_targets, target_type, n_classes, thresholds
         )
-    
+
+    # ===== Phase A: GPT-5 panel ensemble (Phase A) =====
+    # If GPT-5 panel parquets exist for both val and test, run a second pass
+    # that ensembles SPECTER2 probs with GPT-5 panel probs via per-class lambda
+    # tuned on val. Reports under "val_2023_gpt5_ensemble" / "test_2024_gpt5_ensemble"
+    # keys; the original specter-only metrics stay as the primary report fields.
+    val_gpt5_metrics = None
+    test_gpt5_metrics = None
+    val_gpt5 = None
+    test_gpt5 = None
+    if val_df is not None:
+        val_gpt5, n_match_val = _maybe_load_gpt5_panel("val", val_df, n_classes, task)
+    if test_df is not None and len(test_df) > 0:
+        test_gpt5, n_match_test = _maybe_load_gpt5_panel("test", test_df, n_classes, task)
+
+    ensemble_lambdas = None
+    if val_gpt5 is not None and test_gpt5 is not None:
+        print(f"\n  GPT-5 panel ensemble: val matched {n_match_val}/{len(val_df)}, "
+              f"test matched {n_match_test}/{len(test_df)}")
+        # Tune per-class lambda on val (use the same val_thresholds)
+        thresh_arr = np.asarray(thresholds, dtype=np.float64) if thresholds else np.full(n_classes, 0.5)
+        val_blend, test_blend, lambdas = ensemble.build_ensemble_probs(
+            val_probs, val_gpt5, val_targets,
+            test_probs, test_gpt5,
+            target_type=target_type,
+            val_thresholds=thresh_arr,
+        )
+        ensemble_lambdas = lambdas.tolist()
+        val_gpt5_metrics = evaluate_with_thresholds(
+            val_blend, val_targets, target_type, n_classes, thresholds
+        )
+        test_gpt5_metrics = evaluate_with_thresholds(
+            test_blend, test_targets, target_type, n_classes, thresholds
+        )
+        print(f"  Ensemble lambdas: {[round(l, 2) for l in ensemble_lambdas]}")
+        print("    (lambda=1.0 → SPECTER2 only; lambda=0.0 → GPT-5 only)")
+
+    # ===== Phase D: kNN retrieval ensemble =====
+    val_knn = None
+    test_knn = None
+    val_knn_metrics = None
+    test_knn_metrics = None
+    val_full3_metrics = None
+    test_full3_metrics = None
+    full3_weights = None
+    if val_df is not None:
+        val_knn, n_match_val_k = _maybe_load_knn("val", val_df, n_classes, task)
+    if test_df is not None and len(test_df) > 0:
+        test_knn, n_match_test_k = _maybe_load_knn("test", test_df, n_classes, task)
+
+    if val_knn is not None and test_knn is not None and target_type == "multi_label":
+        print(f"\n  kNN retrieval ensemble: val matched {n_match_val_k}/{len(val_df)}, "
+              f"test matched {n_match_test_k}/{len(test_df)}")
+        thresh_arr = np.asarray(thresholds, dtype=np.float64) if thresholds else np.full(n_classes, 0.5)
+        # 2-way blend: SPECTER2 + kNN (per-class lambda)
+        knn_lambdas = ensemble.tune_ensemble_lambda_multilabel(
+            val_probs, val_knn, val_targets, thresh_arr,
+        )
+        val_knn_blend = ensemble.apply_ensemble(val_probs, val_knn, knn_lambdas)
+        test_knn_blend = ensemble.apply_ensemble(test_probs, test_knn, knn_lambdas)
+        val_knn_metrics = evaluate_with_thresholds(
+            val_knn_blend, val_targets, target_type, n_classes, thresholds
+        )
+        test_knn_metrics = evaluate_with_thresholds(
+            test_knn_blend, test_targets, target_type, n_classes, thresholds
+        )
+        # 3-way blend: SPECTER2 + GPT-5 + kNN (per-class triple)
+        if val_gpt5 is not None and test_gpt5 is not None:
+            full3_weights = ensemble.tune_ensemble_weights_3way_multilabel(
+                val_probs, val_gpt5, val_knn, val_targets, thresh_arr,
+            )
+            val_full3 = ensemble.apply_ensemble_3way(val_probs, val_gpt5, val_knn, full3_weights)
+            test_full3 = ensemble.apply_ensemble_3way(test_probs, test_gpt5, test_knn, full3_weights)
+            val_full3_metrics = evaluate_with_thresholds(
+                val_full3, val_targets, target_type, n_classes, thresholds
+            )
+            test_full3_metrics = evaluate_with_thresholds(
+                test_full3, test_targets, target_type, n_classes, thresholds
+            )
+
     # Build report
     report = {
         "task": task,
@@ -335,6 +467,44 @@ def evaluate_task(task: str, device, val_loader, test_loader,
                 "Expected ~0.05-0.10 due to known annotator drift in 2024."
             ),
         }
+
+    # Wire Phase A ensemble metrics into the report (when available).
+    if val_gpt5_metrics is not None:
+        report["val_2023_gpt5_ensemble"] = {
+            "n_papers": len(val_loader.dataset),
+            **val_gpt5_metrics,
+        }
+    if test_gpt5_metrics is not None:
+        report["test_2024_gpt5_ensemble"] = {
+            "n_papers": len(test_loader.dataset),
+            **test_gpt5_metrics,
+        }
+    if ensemble_lambdas is not None:
+        report["gpt5_ensemble_lambdas"] = ensemble_lambdas
+
+    # Wire Phase D + 3-way ensemble metrics
+    if val_knn_metrics is not None:
+        report["val_2023_knn_ensemble"] = {
+            "n_papers": len(val_loader.dataset),
+            **val_knn_metrics,
+        }
+    if test_knn_metrics is not None:
+        report["test_2024_knn_ensemble"] = {
+            "n_papers": len(test_loader.dataset),
+            **test_knn_metrics,
+        }
+    if val_full3_metrics is not None:
+        report["val_2023_full3_ensemble"] = {
+            "n_papers": len(val_loader.dataset),
+            **val_full3_metrics,
+        }
+    if test_full3_metrics is not None:
+        report["test_2024_full3_ensemble"] = {
+            "n_papers": len(test_loader.dataset),
+            **test_full3_metrics,
+        }
+    if full3_weights is not None:
+        report["full3_ensemble_weights"] = full3_weights.tolist()
     
     # Pretty per-class table
     report["per_class_table"] = []
@@ -401,7 +571,62 @@ def evaluate_task(task: str, device, val_loader, test_loader,
         print(f"    Drift gap (val - test macro-F1): "
               f"{report['drift_gap']['macro_f1_val_minus_test']:+.4f}")
 
-    print(f"  Per-class metrics (val 2023):")
+    # Phase A: GPT-5 ensemble summary side-by-side with SPECTER2-only baseline
+    if val_gpt5_metrics is not None and test_gpt5_metrics is not None:
+        print("\n  ===== Phase A: GPT-5 panel ensemble =====")
+        print("  Val 2023 ensemble:")
+        print(f"    Macro-F1:                  {_fmt(val_gpt5_metrics, 'macro_f1')}  "
+              f"(specter-only: {_fmt(val_metrics, 'macro_f1')})")
+        print(f"    Supported macro-F1 (n>=5): {_fmt(val_gpt5_metrics, 'supported_macro_f1')}  "
+              f"(specter-only: {_fmt(val_metrics, 'supported_macro_f1')})")
+        print("  Test 2024 ensemble:")
+        print(f"    Macro-F1:                  {_fmt(test_gpt5_metrics, 'macro_f1')}  "
+              f"(specter-only: {_fmt(test_metrics, 'macro_f1')})")
+        print(f"    Supported macro-F1 (n>=5): {_fmt(test_gpt5_metrics, 'supported_macro_f1')}  "
+              f"(specter-only: {_fmt(test_metrics, 'supported_macro_f1')})")
+        # supported_macro_F1 (n>=10) — the metric the user explicitly chose for publication
+        support = test_gpt5_metrics.get("support", [])
+        per_class_f1 = test_gpt5_metrics.get("per_class_f1", [])
+        per_class_f1_baseline = test_metrics.get("per_class_f1", [])
+        idx10 = [i for i, s in enumerate(support) if s >= 10]
+        if idx10 and per_class_f1 and per_class_f1_baseline:
+            ens10 = float(np.mean([per_class_f1[i] for i in idx10]))
+            base10 = float(np.mean([per_class_f1_baseline[i] for i in idx10]))
+            print(f"    Supported macro-F1 (n>=10, primary metric): "
+                  f"{ens10:.4f}  (specter-only: {base10:.4f})  "
+                  f"gain: {ens10 - base10:+.4f}")
+
+    # Phase D: kNN ensemble + 3-way summary
+    if test_knn_metrics is not None:
+        print("\n  ===== Phase D: kNN retrieval ensemble (SPECTER2 + kNN) =====")
+        print(f"  Test 2024 macro-F1:        {_fmt(test_knn_metrics, 'macro_f1')}  "
+              f"(specter-only: {_fmt(test_metrics, 'macro_f1')})")
+        print(f"  Test 2024 supp_macro_F1 (n>=5): {_fmt(test_knn_metrics, 'supported_macro_f1')}  "
+              f"(specter-only: {_fmt(test_metrics, 'supported_macro_f1')})")
+        sup = test_knn_metrics.get("support", [])
+        pcf = test_knn_metrics.get("per_class_f1", [])
+        pcf_b = test_metrics.get("per_class_f1", [])
+        idx10k = [i for i, s in enumerate(sup) if s >= 10]
+        if idx10k and pcf and pcf_b:
+            print(f"  Test supp_macro_F1 (n>=10): "
+                  f"{float(np.mean([pcf[i] for i in idx10k])):.4f}  "
+                  f"(specter-only: {float(np.mean([pcf_b[i] for i in idx10k])):.4f})")
+    if test_full3_metrics is not None:
+        print("\n  ===== Full 3-way ensemble (SPECTER2 + GPT-5 + kNN) =====")
+        print(f"  Test 2024 macro-F1:        {_fmt(test_full3_metrics, 'macro_f1')}")
+        print(f"  Test 2024 supp_macro_F1 (n>=5): {_fmt(test_full3_metrics, 'supported_macro_f1')}")
+        sup = test_full3_metrics.get("support", [])
+        pcf = test_full3_metrics.get("per_class_f1", [])
+        pcf_b = test_metrics.get("per_class_f1", [])
+        idx10f = [i for i, s in enumerate(sup) if s >= 10]
+        if idx10f and pcf and pcf_b:
+            ens10 = float(np.mean([pcf[i] for i in idx10f]))
+            base10 = float(np.mean([pcf_b[i] for i in idx10f]))
+            print(f"  Test supp_macro_F1 (n>=10, primary metric): "
+                  f"{ens10:.4f}  (specter-only: {base10:.4f})  "
+                  f"gain: {ens10 - base10:+.4f}")
+
+    print("  Per-class metrics (val 2023):")
     for entry in report["per_class_table"]:
         cn = entry["class"]
         v_f1 = entry["val_f1"]

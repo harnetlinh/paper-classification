@@ -245,6 +245,92 @@ LEVEL_AUGMENT_DEFINITIONS = {
 }
 
 
+# ==================== Full classification prompt (Phase A) ====================
+# Used by llm_classify.py to elicit per-paper labels for ALL three tasks
+# (Fields multi-label, Levels multi-label, Method single-label) in one call.
+#
+# Why one combined call instead of three:
+# - System prompt = full codebook v2.1 (~3000 tokens). Repeating it across
+#   3 calls triples both latency and cost.
+# - OpenAI prompt caching applies to the system prompt verbatim — one combined
+#   system prompt is cached after the first call, then reused at the cached
+#   rate for the remaining 561 papers. Three separate prompts pay full price
+#   3x for similar content.
+# - Output JSON is bounded (~300 tokens for the structured response).
+#
+# Schema is INTENTIONALLY binary (true/false) plus per-call confidence rather
+# than a numeric probability, because LLMs are unreliable at calibrated
+# probability output. The downstream ensemble (evaluate.py) converts
+# 3-model panel votes into discrete probabilities {0, 0.33, 0.67, 1.0}.
+
+SYSTEM_PROMPT_FULL_CLASSIFICATION = """You are an expert reviewer classifying educational research papers under codebook v2.1. You return three label sets per paper: Fields (multi-label, choose all that apply from 12), Educational Levels (multi-label, choose all that apply from 6), and Method (single-label, choose exactly one from 5).
+
+## CRITICAL INSTRUCTIONS
+1. The Abstract is the PRIMARY source (~190 words). Title is SECONDARY (~14 words). Base decisions on Abstract content.
+2. Apply the 20% threshold rule: assign a Field label only if the topic contributes ≥20% of the paper content.
+3. Multi-label allowed for Fields and Levels. A paper typically has 2-3 Fields labels and 1-2 Levels labels.
+4. STEM and Non-STEM Education are mutually exclusive by default; assign BOTH only for explicit comparative studies.
+5. For Method, choose exactly one. Default to 'Other' only if no quantitative/qualitative/mixed/review approach is present (rare; favor a definite category when in doubt).
+6. Be CONSERVATIVE — return false / not-this-class when in doubt. Over-prediction is worse than under-prediction here.
+
+""" + CODEBOOK_V2_1 + """
+
+## OUTPUT SCHEMA (strict JSON, no prose outside JSON)
+
+{
+  "fields": {
+    "teaching & learning": true | false,
+    "management, leadership & policy": true | false,
+    "test and assessment": true | false,
+    "Technology in education": true | false,
+    "English Education": true | false,
+    "curriculum": true | false,
+    "psychology in education": true | false,
+    "Special education": true | false,
+    "International education": true | false,
+    "Education economically": true | false,
+    "STEM education": true | false,
+    "Non-STEM Education": true | false
+  },
+  "levels": {
+    "ECE": true | false,
+    "GE": true | false,
+    "HE": true | false,
+    "TVET": true | false,
+    "LLL": true | false,
+    "ALL": true | false
+  },
+  "method": "Quantitative" | "Qualitative" | "Mixed" | "Review" | "Other",
+  "confidence": "high" | "medium" | "low"
+}
+
+Use exact key spellings as shown above (case-sensitive). Never invent extra keys.
+"""
+
+
+def make_full_classification_prompt(title: str, abstract: str) -> tuple:
+    """Build (system, user) prompts for full Fields+Levels+Method classification.
+
+    The system prompt is FROZEN content (codebook + instructions + schema) so
+    OpenAI's prompt caching can amortize its cost across the entire run.
+    The user prompt contains only the variable per-paper data.
+
+    Returns:
+        (system_prompt, user_prompt)
+    """
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+    user = f"""## TITLE
+{title}
+
+## ABSTRACT
+{abstract if abstract else "[MISSING ABSTRACT — decision based on Title only, lower confidence]"}
+
+Classify this paper for all three tasks (Fields, Levels, Method) per the codebook. Output JSON only."""
+    return SYSTEM_PROMPT_FULL_CLASSIFICATION, user
+
+
+# ==================== Level filter prompt (existing, unchanged) ====================
 def make_level_filter_prompt(level_code: str, title: str, abstract: str) -> tuple:
     """Build (system, user) prompts for a Level candidate verification.
 

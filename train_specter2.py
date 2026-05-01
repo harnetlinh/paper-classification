@@ -116,7 +116,27 @@ def load_train_val_test(task: str):
     val_df = gold[gold["Year"] == config.VAL_YEAR].copy().reset_index(drop=True)
     test_df = (df_2024.copy().reset_index(drop=True)
                if len(df_2024) > 0 else pd.DataFrame())
-    
+
+    return train_df, val_df, test_df
+
+
+def load_train_val_test_with_optional_join(task: str, include_val_in_train: bool):
+    """As load_train_val_test, but optionally fold val into train (Phase F).
+
+    When include_val_in_train=True, train_df = train ∪ val and val_df is left
+    intact (used only for in-training monitoring, not for best-model selection
+    in this mode — caller must skip early stopping).
+
+    Why keep val visible at all when folded in: the per-epoch val metrics still
+    provide a sanity-check that the model isn't catastrophically diverging.
+    Threshold tuning in this mode reuses the existing thresholds_*.json from
+    a prior train→val run (caller responsibility).
+    """
+    train_df, val_df, test_df = load_train_val_test(task)
+    if include_val_in_train and len(val_df) > 0:
+        train_df = pd.concat([train_df, val_df], ignore_index=True)
+        # Reset index so PaperDataset's df.iloc[] still works.
+        train_df = train_df.reset_index(drop=True)
     return train_df, val_df, test_df
 
 
@@ -172,41 +192,65 @@ class SpecterClassifier(nn.Module):
         return logits
 
 
-def _model_save_path(task: str, seed: int):
+def _model_save_path(task: str, seed: int, include_val: bool = False):
     """Save path for a model. seed=config.SEED uses the legacy single path
     (`model_{task}.pt`); other seeds use `model_{task}_s{seed}.pt`. This keeps
     a single-model run drop-in compatible with existing evaluate/inference,
     while ensemble runs produce sibling files that the loaders can pick up.
+
+    include_val=True (Phase F) appends `_trainval` to the filename so the
+    train+val refit is saved alongside the original train-only checkpoint
+    rather than overwriting it.
     """
-    if seed == config.SEED:
+    suffix = "_trainval" if include_val else ""
+    if seed == config.SEED and not include_val:
         return config.model_path(task)
-    return config.OUTPUT_DIR / f"model_{task}_s{seed}.pt"
+    if seed == config.SEED:
+        return config.OUTPUT_DIR / f"model_{task}{suffix}.pt"
+    return config.OUTPUT_DIR / f"model_{task}_s{seed}{suffix}.pt"
 
 
 # ==================== Training ====================
-def train_model(task: str, smoke: bool = False, seed: int = None):
-    """Train one model for the given task."""
+def train_model(task: str, smoke: bool = False, seed: int = None,
+                include_val_in_train: bool = False):
+    """Train one model for the given task.
+
+    Args:
+        include_val_in_train: Phase F flag. When True, train on train ∪ val.
+            Caller must reuse thresholds from a prior train→val run because
+            we no longer have a held-out val for threshold tuning. Best-model
+            selection uses fixed-epoch (config.EPOCHS) instead of val-monitor
+            early stopping.
+    """
     if seed is None:
         seed = config.SEED
     is_ensemble_seed = seed != config.SEED
     print("=" * 80)
     suffix = f"  seed={seed}" + ("  [ENSEMBLE]" if is_ensemble_seed else "")
+    if include_val_in_train:
+        suffix += "  [TRAIN+VAL]"
     print(f"Training task: {task}{suffix}" + (" [SMOKE TEST MODE]" if smoke else ""))
     print("=" * 80)
 
     # Deterministic setup
     utils.set_deterministic(seed)
-    
+
     # Device autodetect
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cpu":
         print("WARNING: Training on CPU will be VERY slow (~10h for 5 epochs full data)")
         print("         Recommended: use Colab GPU or local CUDA-enabled GPU")
-    
+
     # Load data
-    train_df, val_df, test_df = load_train_val_test(task)
+    train_df, val_df, test_df = load_train_val_test_with_optional_join(
+        task, include_val_in_train=include_val_in_train,
+    )
     print(f"Data sizes — Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+    if include_val_in_train:
+        print("  [Phase F] Val 2023 has been folded into train. Val metrics during training "
+              "are no longer held-out — they reflect train fit, not generalization. "
+              "Threshold tuning will be SKIPPED; reuse thresholds from prior train→val run.")
     
     # Smoke test: subsample
     if smoke:
@@ -404,7 +448,14 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
 
         is_first_epoch = epoch == 0
         improved = selected_metric > best_val_metric
-        save_path = _model_save_path(task, seed)
+        save_path = _model_save_path(task, seed, include_val=include_val_in_train)
+        # Phase F: when val is folded into train, val metric is leaked, so
+        # it's not a generalization signal. Save EVERY epoch (overwriting),
+        # use config.EPOCHS as the fixed budget, no early stop.
+        if include_val_in_train:
+            torch.save(model.state_dict(), save_path)
+            print(f"    Saved (epoch {epoch+1}/{n_epochs}, train+val mode — fixed budget)")
+            continue
         if improved or is_first_epoch:
             if improved:
                 best_val_metric = selected_metric
@@ -420,14 +471,17 @@ def train_model(task: str, smoke: bool = False, seed: int = None):
                 break
 
     # Reload best
-    save_path = _model_save_path(task, seed)
+    save_path = _model_save_path(task, seed, include_val=include_val_in_train)
     if save_path.exists():
         model.load_state_dict(torch.load(save_path, map_location=device))
 
     # Per-class threshold tuning (multi-label only) — only for the canonical
     # seed run; ensemble-seed runs leave threshold tuning to the ensemble
     # combiner (which averages probabilities across seeds first, then tunes).
-    if target_type == "multi_label" and not smoke and not is_ensemble_seed:
+    # Phase F (include_val_in_train): val is no longer held-out, so tuning
+    # thresholds on it would be circular. Reuse existing thresholds_*.json
+    # from the prior train→val run.
+    if target_type == "multi_label" and not smoke and not is_ensemble_seed and not include_val_in_train:
         print("\n--- Tuning per-class thresholds (robust: F1-grid in safe range) ---")
         val_probs, val_targets = predict_probs(model, val_loader, device, target_type)
         low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
@@ -681,6 +735,11 @@ def main():
                              f"{config.ENSEMBLE_SEEDS}. Linear training-time cost.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override single training seed (default: config.SEED)")
+    parser.add_argument("--include-val-in-train", action="store_true",
+                        help="Phase F: fold val 2023 into train, retrain for fixed "
+                             "epochs (no early stop, no threshold tuning). Reuses "
+                             "thresholds_*.json from a prior train→val run. Saves "
+                             "models with `_trainval` suffix.")
     args = parser.parse_args()
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -692,8 +751,11 @@ def main():
 
     for t in tasks:
         for seed in seeds:
-            train_model(t, smoke=args.smoke, seed=seed)
-        if args.ensemble and not args.smoke:
+            train_model(t, smoke=args.smoke, seed=seed,
+                        include_val_in_train=args.include_val_in_train)
+        if args.ensemble and not args.smoke and not args.include_val_in_train:
+            # build_ensemble tunes thresholds on val — also incompatible with
+            # train+val mode for the same circular-tuning reason.
             build_ensemble(t)
 
 
