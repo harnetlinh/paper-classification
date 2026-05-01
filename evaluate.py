@@ -461,43 +461,6 @@ def build_eval_inputs(task: str):
     }
 
 
-def build_loaders(task: str):
-    """Build val and test DataLoaders for a task."""
-    from transformers import AutoTokenizer
-    
-    train_df, val_df, test_df = load_train_val_test(task)
-    
-    if task in ("fields", "levels"):
-        target_cols = get_target_cols(task)
-        n_classes = len(target_cols)
-        target_type = "multi_label"
-    else:
-        target_cols = None
-        n_classes = len(config.METHODS_5)
-        target_type = "single_label"
-    
-    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
-    method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
-    
-    val_ds = utils.PaperDataset(
-        val_df, tokenizer,
-        target_cols=target_cols, target_type=target_type,
-        method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
-    )
-    val_loader = DataLoader(val_ds, batch_size=config.effective_batch_size(), shuffle=False)
-    
-    test_loader = None
-    if len(test_df) > 0:
-        test_ds = utils.PaperDataset(
-            test_df, tokenizer,
-            target_cols=target_cols, target_type=target_type,
-            method_to_idx=method_to_idx, max_length=config.MAX_LENGTH,
-        )
-        test_loader = DataLoader(test_ds, batch_size=config.effective_batch_size(), shuffle=False)
-    
-    return val_loader, test_loader, target_type, n_classes
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=["fields", "levels", "method", "all"], default="all")

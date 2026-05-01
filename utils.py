@@ -138,13 +138,27 @@ class FocalCrossEntropyLoss(nn.Module):
 def build_input_texts(df, sep: str):
     """Concatenate per-paper input fields into one string each.
 
-    Always uses Title + Abstract. When config.USE_RICH_FEATURES is True
-    (default) and the dataframe has the corresponding columns, also appends
-    Author Keywords / Source title / Document type — each prefixed with a
-    short tag so the encoder can tell them apart from the abstract.
+    Layout strategy (when config.USE_RICH_FEATURES is True):
+        Title [SEP] Keywords: ... ; Type: ...; Journal: ... [SEP] Abstract
 
-    Field-missing rows: the corresponding section is silently skipped; we
-    never insert the literal string "None" or "nan" into the input.
+    Why this order:
+    - Title goes first (closest to [CLS]) — short and high-signal.
+    - Author Keywords, Document type, Journal go SECOND — they're high-signal
+      topic markers and should be in the model's strong-attention window
+      (token positions 30-100). The previous layout put them AFTER Abstract,
+      where they ended up at positions 200-500 (far from CLS) and 3% of the
+      time got truncated entirely past max_length=512. This was the main
+      reason rich features barely moved metrics.
+    - Abstract goes LAST — it's the longest field (~250 tokens) and is the
+      one we'd rather truncate from the end than lose Keywords/Type/Journal.
+      Default tokenizer truncation is from the right, so Abstract is the
+      first to lose tokens when over budget.
+
+    When USE_RICH_FEATURES is False or rich-feature columns are missing,
+    falls back to the legacy Title [SEP] Abstract layout.
+
+    Field-missing rows: the section is silently skipped; never inserts the
+    literal string "None" or "nan" into the input.
     """
     use_rich = bool(getattr(config, "USE_RICH_FEATURES", False))
     has_kw = use_rich and "Author Keywords" in df.columns
@@ -154,20 +168,32 @@ def build_input_texts(df, sep: str):
     texts = []
     for i in range(len(df)):
         row = df.iloc[i]
-        parts = [str(row.get("Title", "")).strip(), str(row.get("Abstract", "")).strip()]
+        title = str(row.get("Title", "")).strip()
+        abstract = str(row.get("Abstract", "")).strip()
+
+        # Compose the metadata block — empty fields are skipped, multiple are
+        # joined by " ; " (semicolon) so the encoder reads them as one segment
+        # rather than separate sentences (avoids extra [SEP] tokens that
+        # SPECTER2 wasn't pretrained against).
+        meta_chunks = []
         if has_kw:
             kw = str(row.get("Author Keywords", "") or "").strip()
             if kw and kw.lower() not in ("nan", "none"):
-                parts.append(f"Keywords: {kw}")
-        if has_src:
-            src = str(row.get("Source title", "") or "").strip()
-            if src and src.lower() not in ("nan", "none"):
-                parts.append(f"Journal: {src}")
+                meta_chunks.append(f"Keywords: {kw}")
         if has_dt:
             dt = str(row.get("Document type", "") or "").strip()
             if dt and dt.lower() not in ("nan", "none"):
-                parts.append(f"Type: {dt}")
-        texts.append(sep.join(parts))
+                meta_chunks.append(f"Type: {dt}")
+        if has_src:
+            src = str(row.get("Source title", "") or "").strip()
+            if src and src.lower() not in ("nan", "none"):
+                meta_chunks.append(f"Journal: {src}")
+
+        if meta_chunks:
+            meta = " ; ".join(meta_chunks)
+            texts.append(sep.join([title, meta, abstract]))
+        else:
+            texts.append(sep.join([title, abstract]))
     return texts
 
 
@@ -309,32 +335,6 @@ def tune_thresholds_per_class(probs, targets, threshold_grid):
         best_thresholds.append(best_t)
         best_f1s.append(best_f1)
     return best_thresholds, best_f1s
-
-
-def youden_j_threshold(probs_c, targets_c):
-    """Pick threshold that maximises Youden's J = TPR - FPR on the ROC curve.
-
-    Used as a fallback when val support is too low for stable F1-grid tuning.
-    Youden's J is support-robust: it does not weight rare positives
-    disproportionately compared to F1 (which fails violently when support<10).
-    Returns (threshold, j_value) or (0.5, 0.0) if undefined.
-    """
-    from sklearn.metrics import roc_curve
-    targets_c = targets_c.astype(int)
-    n_pos = int(targets_c.sum())
-    n_neg = int(len(targets_c) - n_pos)
-    if n_pos == 0 or n_neg == 0:
-        return 0.5, 0.0
-    fpr, tpr, thresholds = roc_curve(targets_c, probs_c)
-    j = tpr - fpr
-    best_idx = j.argmax()
-    t = float(thresholds[best_idx])
-    # roc_curve sometimes returns infinity at threshold[0]; clamp to grid range
-    if t > 1.0:
-        t = 1.0
-    if t < 0.0:
-        t = 0.0
-    return t, float(j[best_idx])
 
 
 def tune_thresholds_robust(probs, targets, threshold_grid, low_support_threshold=10,
