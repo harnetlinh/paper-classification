@@ -44,7 +44,11 @@ def render(task_name, task_report):
 
     rows = [("SPECTER2 only (baseline)", base_macro, base_supp5, base_supp10, 0.0)]
 
+    # M2: quantification appears as one row in the variants table (when
+    # USE_QUANTIFICATION_AT_TEST + QUANTIFICATION_REPORT_BOTH yielded a
+    # `test_2024_quantified` block in the eval report).
     for key, label in [
+        ("test_2024_quantified", "+ Quantification (Saerens)"),
         ("test_2024_gpt5_ensemble", "+ GPT-5 panel"),
         ("test_2024_knn_ensemble", "+ kNN retrieval"),
         ("test_2024_full3_ensemble", "+ GPT-5 + kNN (3-way)"),
@@ -83,6 +87,29 @@ def render(task_name, task_report):
             mark = " ★" if g > 0.05 else (" ↓" if g < -0.02 else "  ")
             tag = " (n<10, excluded from supp)" if n < 10 else ""
             print(f" {cn:<35} {b:>12.3f} {e:>12.3f} {g:>+10.3f} {n:>8d}{mark}{tag}")
+
+    # M2: quantification detail block — shows estimated test prior vs train
+    # prior per class, and the threshold delta. Useful for the drift report.
+    quant = task_report.get("test_2024_quantified")
+    if quant:
+        print()
+        print(f" M2 Quantification ({quant.get('estimator', '?')}):")
+        per_class_table = task_report.get("per_class_table", [])
+        thresholds_baseline = task_report.get("thresholds") or []
+        adjusted = quant.get("adjusted_thresholds") or []
+        priors = quant.get("estimated_test_prior") or []
+        if per_class_table and adjusted and priors:
+            print(f" {'Class':<35} {'val_thr':>9} {'adj_thr':>9} {'shift':>9} "
+                  f"{'est_prior':>11} {'test_n':>7}")
+            for i, entry in enumerate(per_class_table):
+                cn = entry["class"]
+                n = entry.get("test_support", 0)
+                vt = thresholds_baseline[i] if i < len(thresholds_baseline) else float("nan")
+                at = adjusted[i] if i < len(adjusted) else float("nan")
+                pr = priors[i] if i < len(priors) else float("nan")
+                shift = at - vt if not (np.isnan(vt) or np.isnan(at)) else float("nan")
+                print(f" {cn:<35} {vt:>9.3f} {at:>9.3f} {shift:>+9.3f} "
+                      f"{pr:>11.4f} {n:>7d}")
 
 
 def main():

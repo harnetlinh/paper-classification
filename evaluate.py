@@ -361,6 +361,63 @@ def evaluate_task(task: str, device, val_loader, test_loader,
             test_probs, test_targets, target_type, n_classes, thresholds
         )
 
+    # ===== M2: Quantification (prior-shift threshold adjustment) =====
+    # When test label distribution differs from train (temporal drift), the
+    # val-tuned thresholds become miscalibrated. Saerens EM (or PACC) estimates
+    # the test prior from unlabeled test predictions and shifts thresholds in
+    # log-odds space. We compute the adjusted-threshold metrics for BOTH
+    # val and test (val mostly serves as a sanity check — its prior is empirical
+    # so adjustment is near-identity); test is where the adjustment matters.
+    # Only multi-label tasks get quantified — single-label argmax is unaffected
+    # by per-class thresholds.
+    test_metrics_quantified = None
+    val_metrics_quantified = None
+    quant_test_prior = None
+    quant_adjusted_thresholds = None
+    if (target_type == "multi_label"
+            and test_metrics is not None
+            and thresholds is not None
+            and bool(getattr(config, "USE_QUANTIFICATION_AT_TEST", False))):
+        try:
+            import quantify
+        except ImportError:
+            quantify = None
+        if quantify is not None:
+            estimator = getattr(config, "QUANTIFICATION_ESTIMATOR", "saerens_em")
+            try:
+                quant_test_prior, quant_adjusted_thresholds = quantify.quantified_thresholds(
+                    val_probs=val_probs,
+                    val_targets=val_targets,
+                    test_probs=test_probs,
+                    val_thresholds=np.asarray(thresholds, dtype=np.float64),
+                    target_type=target_type,
+                    estimator=estimator,
+                )
+                test_metrics_quantified = evaluate_with_thresholds(
+                    test_probs, test_targets, target_type, n_classes,
+                    quant_adjusted_thresholds.tolist(),
+                )
+                # Sanity: re-eval val with adjusted thresholds (val_prior ≈ same
+                # as train_prior empirically, so the shift here is near-identity;
+                # any large delta would indicate a bug in the estimator).
+                val_metrics_quantified = evaluate_with_thresholds(
+                    val_probs, val_targets, target_type, n_classes,
+                    quant_adjusted_thresholds.tolist(),
+                )
+                delta_macro = (test_metrics_quantified["macro_f1"]
+                               - test_metrics["macro_f1"])
+                delta_supp = (test_metrics_quantified.get("supported_macro_f1", 0.0)
+                              - test_metrics.get("supported_macro_f1", 0.0))
+                print(f"\n  Quantification ({estimator}): "
+                      f"test macro-F1 delta = {delta_macro:+.4f}  "
+                      f"supp-F1 delta = {delta_supp:+.4f}")
+                if delta_macro < -0.02:
+                    print("    WARNING: quantification REGRESSED test macro-F1 by "
+                          f"{abs(delta_macro):.4f}. Inspect prior estimates per class.")
+            except Exception as exc:
+                print(f"  Quantification failed ({type(exc).__name__}: {exc}); "
+                      "falling back to val-tuned thresholds only.")
+
     # ===== Phase A: GPT-5 panel ensemble (Phase A) =====
     # If GPT-5 panel parquets exist for both val and test, run a second pass
     # that ensembles SPECTER2 probs with GPT-5 panel probs via per-class lambda
@@ -468,6 +525,40 @@ def evaluate_task(task: str, device, val_loader, test_loader,
             ),
         }
 
+    # Wire M2 quantification metrics into the report.
+    # When QUANTIFICATION_REPORT_BOTH=True, both the quantified and the
+    # baseline (val-tuned) metrics are reported under separate keys, so the
+    # impact is auditable. When False, the quantified metric replaces test_2024
+    # in deployment-style usage.
+    if test_metrics_quantified is not None:
+        report_both = bool(getattr(config, "QUANTIFICATION_REPORT_BOTH", True))
+        report["test_2024_quantified"] = {
+            "n_papers": len(test_loader.dataset),
+            "estimator": getattr(config, "QUANTIFICATION_ESTIMATOR", "saerens_em"),
+            "estimated_test_prior": (
+                quant_test_prior.tolist() if quant_test_prior is not None else None
+            ),
+            "adjusted_thresholds": (
+                quant_adjusted_thresholds.tolist()
+                if quant_adjusted_thresholds is not None else None
+            ),
+            **test_metrics_quantified,
+        }
+        if val_metrics_quantified is not None:
+            report["val_2023_quantified"] = {
+                "n_papers": len(val_loader.dataset),
+                **val_metrics_quantified,
+            }
+        if not report_both:
+            # Deployment-style: quantified version is the primary test_2024.
+            # Keep the original under a clearly-labeled key so the comparison
+            # is never lost.
+            report["test_2024_no_quantification"] = report.pop("test_2024")
+            report["test_2024"] = {
+                "n_papers": len(test_loader.dataset),
+                **test_metrics_quantified,
+            }
+
     # Wire Phase A ensemble metrics into the report (when available).
     if val_gpt5_metrics is not None:
         report["val_2023_gpt5_ensemble"] = {
@@ -570,6 +661,26 @@ def evaluate_task(task: str, device, val_loader, test_loader,
               f"({test_metrics.get('high_support_classes_count', 0)} classes)")
         print(f"    Drift gap (val - test macro-F1): "
               f"{report['drift_gap']['macro_f1_val_minus_test']:+.4f}")
+
+    # M2: Quantification summary (side-by-side vs val-tuned thresholds).
+    if test_metrics_quantified is not None and test_metrics is not None:
+        est = getattr(config, "QUANTIFICATION_ESTIMATOR", "saerens_em")
+        print(f"\n  ===== M2: Quantification ({est}) =====")
+        print("  Test 2024 with adjusted thresholds:")
+        print(f"    Macro-F1:                  {_fmt(test_metrics_quantified, 'macro_f1')}  "
+              f"(val-tuned: {_fmt(test_metrics, 'macro_f1')})")
+        print(f"    Supported macro-F1 (n>=5): {_fmt(test_metrics_quantified, 'supported_macro_f1')}  "
+              f"(val-tuned: {_fmt(test_metrics, 'supported_macro_f1')})")
+        # supp_macro_F1 (n>=10) — primary publication metric
+        sup = test_metrics_quantified.get("support", [])
+        pcf_q = test_metrics_quantified.get("per_class_f1", [])
+        pcf_b = test_metrics.get("per_class_f1", [])
+        idx10q = [i for i, s in enumerate(sup) if s >= 10]
+        if idx10q and pcf_q and pcf_b:
+            q10 = float(np.mean([pcf_q[i] for i in idx10q]))
+            b10 = float(np.mean([pcf_b[i] for i in idx10q]))
+            print(f"    Supported macro-F1 (n>=10, primary metric): "
+                  f"{q10:.4f}  (val-tuned: {b10:.4f})  delta: {q10 - b10:+.4f}")
 
     # Phase A: GPT-5 ensemble summary side-by-side with SPECTER2-only baseline
     if val_gpt5_metrics is not None and test_gpt5_metrics is not None:

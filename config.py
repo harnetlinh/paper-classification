@@ -216,6 +216,31 @@ ENSEMBLE_SEEDS = [42, 123, 456]   # 1 seed = no ensemble; 3+ seeds = ensemble
 # and the swapped (Abstract, Title) — same paper, encoder sees it twice.
 TTA_VARIANTS = ["title_then_abstract", "abstract_then_title"]
 
+# ==================== QUANTIFICATION (M2 — Prior-Shift Adjustment) ====================
+# Adjust per-class thresholds at test time when test label distribution
+# differs from train. Implemented in quantify.py via Saerens et al. 2002
+# (Neural Computation) EM, with PACC bootstrap-init for stability under
+# extreme prior shifts. CRITICAL for temporal-split tasks where test 2024
+# may have very different Field/Level proportions than train 2013-2022 —
+# observed in this project: psychology drops 18% → 0.5%, Special edu rises
+# 1% → 12.6%, etc.
+# Reference: UPGRADE_ROADMAP_v2.md §3.2.
+USE_QUANTIFICATION_AT_TEST = True
+
+# Estimator for the test-set prior:
+#   "pacc"        — Probabilistic Adjusted Classify and Count, closed-form,
+#                   robust under extreme shift (verified on this dataset).
+#   "saerens_em"  — Saerens-Latinne-Decaestecker EM, more accurate when shift
+#                   is mild but can diverge under extreme shift unless
+#                   PACC-bootstrapped (the implementation does this).
+#   "both"        — Run both, report side-by-side. Useful for diagnostics.
+QUANTIFICATION_ESTIMATOR = "saerens_em"
+
+# Always report eval metrics WITHOUT quantification too, for comparison.
+# Lets the publication / drift report show the impact transparently.
+# When False, only the quantified metric is reported (deployment-style).
+QUANTIFICATION_REPORT_BOTH = True
+
 # ==================== LLM CONFIG (OpenAI-only ensemble) ====================
 # 3 different OpenAI models for diversity. All use temperature=0 + seed=SEED for reproducibility.
 # Pricing (April 2026):
