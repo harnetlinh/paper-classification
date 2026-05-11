@@ -441,7 +441,7 @@ def train_model(task: str, smoke: bool = False, seed: int = None,
             low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
             _, f1s_ep, _ = utils.tune_thresholds_robust(
                 val_probs_ep, val_targets_ep, config.THRESHOLD_GRID,
-                low_support_threshold=low_support,
+                low_support_cutoff=low_support,
             )
             val_tuned_f1 = float(np.mean(f1s_ep))
             val_metrics["macro_f1_tuned"] = val_tuned_f1
@@ -501,25 +501,26 @@ def train_model(task: str, smoke: bool = False, seed: int = None,
     # thresholds on it would be circular. Reuse existing thresholds_*.json
     # from the prior train→val run.
     if target_type == "multi_label" and not smoke and not is_ensemble_seed and not include_val_in_train:
-        print("\n--- Tuning per-class thresholds (robust: F1-grid in safe range) ---")
+        print("\n--- Tuning per-class thresholds (support-tiered grid + precision floor) ---")
         val_probs, val_targets = predict_probs(model, val_loader, device, target_type)
         low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
-        thresholds, f1s, fallback_used = utils.tune_thresholds_robust(
+        thresholds, f1s, reasons = utils.tune_thresholds_robust(
             val_probs, val_targets, config.THRESHOLD_GRID,
-            low_support_threshold=low_support,
+            low_support_cutoff=low_support,
         )
         class_names = get_class_names(task)
         for i, cn in enumerate(class_names):
-            if fallback_used[i]:
-                print(f"    [{cn}] used safe range [0.3, 0.7] (val support too low) → "
-                      f"threshold={thresholds[i]:.3f}")
+            # Log every class's reason so the audit trail is in the training log.
+            print(f"    [{cn:<35}] threshold={thresholds[i]:.3f}  reason={reasons[i]}")
         threshold_data = {
             "thresholds": [float(t) for t in thresholds],
             "per_class_f1_at_optimal": [float(f) for f in f1s],
-            "fallback_used": [bool(b) for b in fallback_used],
+            "reasons": [str(r) for r in reasons],
             "class_names": class_names,
             "macro_f1_with_optimal_thresholds": float(np.mean(f1s)),
-            "low_support_threshold_fallback": int(low_support),
+            "low_support_cutoff": int(low_support),
+            "mid_support_cutoff": 30,
+            "min_precision": 0.30,
         }
         with open(config.threshold_path(task), "w", encoding="utf-8") as f:
             json.dump(threshold_data, f, indent=2, ensure_ascii=False)
@@ -627,20 +628,24 @@ def build_ensemble(task: str):
         return None
     avg_probs = sum_probs / n_loaded
 
-    # Tune thresholds on averaged probabilities
+    # Tune thresholds on averaged probabilities (support-tiered + precision floor).
     low_support = getattr(config, "LOW_SUPPORT_THRESHOLD_FALLBACK", 10)
-    thresholds, f1s, fallback_used = utils.tune_thresholds_robust(
+    thresholds, f1s, reasons = utils.tune_thresholds_robust(
         avg_probs, val_targets, config.THRESHOLD_GRID,
-        low_support_threshold=low_support,
+        low_support_cutoff=low_support,
     )
     class_names = get_class_names(task)
+    for i, cn in enumerate(class_names):
+        print(f"    [{cn:<35}] threshold={thresholds[i]:.3f}  reason={reasons[i]}")
     threshold_data = {
         "thresholds": [float(t) for t in thresholds],
         "per_class_f1_at_optimal": [float(f) for f in f1s],
-        "fallback_used": [bool(b) for b in fallback_used],
+        "reasons": [str(r) for r in reasons],
         "class_names": class_names,
         "macro_f1_with_optimal_thresholds": float(np.mean(f1s)),
-        "low_support_threshold_fallback": int(low_support),
+        "low_support_cutoff": int(low_support),
+        "mid_support_cutoff": 30,
+        "min_precision": 0.30,
         "ensemble_seeds": list(seeds[:n_loaded]),
         "n_models_in_ensemble": n_loaded,
     }

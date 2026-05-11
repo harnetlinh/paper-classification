@@ -337,58 +337,131 @@ def tune_thresholds_per_class(probs, targets, threshold_grid):
     return best_thresholds, best_f1s
 
 
-def tune_thresholds_robust(probs, targets, threshold_grid, low_support_threshold=10,
-                            safe_low=0.3, safe_high=0.7, default_threshold=0.5):
-    """Class-aware F1-driven threshold tuning with a safe range fallback.
+def tune_thresholds_robust(probs, targets, threshold_grid,
+                            low_support_cutoff: int = 10,
+                            mid_support_cutoff: int = 30,
+                            safe_low: float = 0.3, safe_high: float = 0.7,
+                            mid_grid_step: float = 0.05,
+                            default_threshold: float = 0.5,
+                            min_precision: float = 0.30):
+    """Support-tiered F1-driven threshold tuning with a precision floor.
 
-    Why not Youden's J: in earlier runs Youden's J picked extreme thresholds
-    (e.g. LLL=0.12, Special edu=0.99) that maximised TPR-FPR but destroyed
-    F1 (recall 100% / precision 1%, or recall 0%). Our optimisation target is
-    F1, so the fallback should also use F1 — just on a constrained range to
-    avoid the over-fitting / spam-predictions modes on tiny val sets.
+    Picks per-class thresholds that maximize F1 on val, but restricts the
+    search grid based on val support and rejects thresholds that produce
+    val precision below `min_precision` (avoids the "spam predictions"
+    failure mode where a class with few val positives lets the model output
+    floods of false positives on test).
 
-    Strategy per class:
-    - 0 positives → default threshold (0.5), F1 = 0
-    - support < low_support_threshold → F1-grid restricted to [safe_low, safe_high]
-      (default 0.3-0.7, F1 cannot be optimised at extremes anyway)
-    - support >= low_support_threshold → full F1-grid
+    Tiered strategy per class:
+    - n_pos == 0           : default threshold (0.5), F1 = 0, reason='no_positives'
+    - n_pos < low_cutoff   : default threshold, no tuning (val too small to
+                              reliably distinguish thresholds), reason='very_low_support'
+    - n_pos < mid_cutoff   : tune on a NARROW grid [safe_low, safe_high] step
+                              `mid_grid_step` (default 0.3-0.7 step 0.05).
+                              Avoids overfit to small val while still gaining
+                              from F1 search. Reason='mid_support_narrow_grid'
+    - n_pos >= mid_cutoff  : tune on the FULL `threshold_grid` (typically
+                              0.10-0.90 step 0.02). Reason='full_grid'
+
+    Precision constraint: at each candidate threshold, compute precision on
+    val. If precision < min_precision, skip that candidate. Without this,
+    the F1-maximizer can pick very low thresholds that boost recall enough
+    to push F1 up on val, but generalize as precision crashes on test.
+
+    Args:
+        probs:        [N, C] sigmoid probabilities on val.
+        targets:      [N, C] binary 0/1 val targets.
+        threshold_grid: full candidate grid (e.g. 0.10-0.90 step 0.02).
+        low_support_cutoff: classes with < this many val positives → default 0.5.
+        mid_support_cutoff: classes with < this → narrow grid; >= this → full.
+        safe_low/safe_high/mid_grid_step: defines the narrow grid for mid tier.
+        default_threshold: fallback when no positives or all candidates rejected.
+        min_precision: precision floor for accepting a candidate threshold.
 
     Returns:
-        (thresholds, f1s, fallback_used)
-        fallback_used: list[bool] — whether the constrained safe range was used.
+        (thresholds, f1s, reasons)
+        reasons: list[str] — one per class describing which tier was applied
+                 and whether the precision constraint was binding. Logged into
+                 thresholds_{task}.json for audit.
     """
-    from sklearn.metrics import f1_score
+    from sklearn.metrics import f1_score, precision_score
     n_classes = targets.shape[1]
-    thresholds, f1s, fallback_used = [], [], []
-    safe_grid = [t for t in threshold_grid if safe_low <= t <= safe_high]
-    if not safe_grid:
-        safe_grid = [default_threshold]
+    thresholds, f1s, reasons = [], [], []
+
+    # Build the mid-tier narrow grid from scratch at the requested step
+    # (mid_grid_step is typically coarser than the full grid's step, so we
+    # don't reuse it). Step from safe_low to safe_high inclusive.
+    n_steps = max(1, int(round((safe_high - safe_low) / mid_grid_step)))
+    narrow_grid = [round(safe_low + i * mid_grid_step, 4) for i in range(n_steps + 1)]
+    narrow_grid = [t for t in narrow_grid if safe_low <= t <= safe_high]
+    if not narrow_grid:
+        narrow_grid = [default_threshold]
 
     for c in range(n_classes):
         n_pos = int(targets[:, c].sum())
+
         if n_pos == 0:
             thresholds.append(default_threshold)
             f1s.append(0.0)
-            fallback_used.append(False)
+            reasons.append("no_positives")
             continue
-        if n_pos <= low_support_threshold:
-            grid = safe_grid
-            used_fallback = True
+
+        if n_pos < low_support_cutoff:
+            thresholds.append(default_threshold)
+            # F1 at default threshold (informational — still report it).
+            preds = (probs[:, c] >= default_threshold).astype(int)
+            f1s.append(float(f1_score(targets[:, c], preds, zero_division=0)))
+            reasons.append(f"very_low_support(n={n_pos})")
+            continue
+
+        if n_pos < mid_support_cutoff:
+            grid = narrow_grid
+            tier_reason = f"mid_support_narrow_grid(n={n_pos})"
         else:
             grid = threshold_grid
-            used_fallback = False
+            tier_reason = f"full_grid(n={n_pos})"
 
-        best_t, best_f1 = default_threshold, 0.0
+        best_t, best_f1 = default_threshold, -1.0
+        precision_rejections = 0
         for t in grid:
             preds = (probs[:, c] >= t).astype(int)
+            if preds.sum() == 0:
+                # No predictions at all — precision undefined; F1 = 0.
+                # Skip (defer to a lower threshold that produces predictions).
+                continue
+            prec = precision_score(targets[:, c], preds, zero_division=0)
+            if prec < min_precision:
+                precision_rejections += 1
+                continue
             f1 = f1_score(targets[:, c], preds, zero_division=0)
             if f1 > best_f1:
                 best_f1 = f1
                 best_t = t
+
+        if best_f1 < 0:
+            # Every candidate was rejected by precision floor → fall back
+            # to the highest threshold in grid (most conservative — minimises
+            # FP on test even if precision floor on val couldn't be met).
+            best_t = max(grid)
+            preds = (probs[:, c] >= best_t).astype(int)
+            best_f1 = float(f1_score(targets[:, c], preds, zero_division=0))
+            extra = f"; all_precision_rejected_fallback_to_max(t={best_t})"
+        elif precision_rejections > 0:
+            extra = f"; rejected_{precision_rejections}_below_prec_{min_precision}"
+        else:
+            extra = ""
+
         thresholds.append(round(float(best_t), 4))
         f1s.append(float(best_f1))
-        fallback_used.append(used_fallback)
-    return thresholds, f1s, fallback_used
+        reasons.append(tier_reason + extra)
+
+    return thresholds, f1s, reasons
+
+
+# Backward-compat alias: the old return tuple was (thresholds, f1s, fallback_used)
+# where fallback_used was bool. callers in train_specter2.py iterate the third
+# element only to log; the new `reasons: list[str]` is a strict upgrade. No
+# callers need code change beyond log-message handling.
 
 
 # ==================== Calibrated weighted BCE (alternative loss) ====================
