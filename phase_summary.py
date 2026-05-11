@@ -1,15 +1,21 @@
 """
 Phase summary: print a side-by-side comparison of all ensemble variants
-against the SPECTER2-only baseline, focused on supported_macro_F1 (n>=10),
-the metric chosen for publication.
+against the SPECTER2-only baseline.
 
-Reads the most recent eval_report.json and renders a single table per task:
+PRIMARY METRIC: high-support macro_F1 — average per-class test F1, restricted
+to classes with VAL support >= HIGH_SUPPORT_VAL_THRESHOLD (default 50).
 
-    Variant                        macro_F1     supp_F1(n>=5)  supp_F1(n>=10)  gain
-    SPECTER2 only (baseline)       0.4090       0.4727         0.4660          --
-    + GPT-5 panel                  0.5xxx       0.5xxx         0.5xxx          +0.0xxx
-    + kNN retrieval                0.4xxx       0.4xxx         0.4xxx          +0.0xxx
-    + GPT-5 + kNN (full 3-way)     0.5xxx       0.5xxx         0.5xxx          +0.0xxx
+Why val support, not test support, drives the cutoff:
+- Test labels are the metric target; using test support to select classes
+  would let class composition leak into the metric definition. Val support
+  is the methodologically clean alternative — same codebook v2.1 application
+  as test, but separated by year and not used as the evaluation target.
+- 50 is the bibliometric-paper convention threshold ("research-grade
+  reliability"; below 50 positive samples a class's F1 is noise-dominated).
+
+Raw macro_F1 (12-of-12 / 6-of-6 / 5-of-5 classes) is still printed but
+clearly labeled as "contains low-support noise" — useful for completeness
+in the publication but not the decision metric.
 
 Usage: python phase_summary.py [--report outputs/eval_report.json]
 """
@@ -20,18 +26,30 @@ from pathlib import Path
 import numpy as np
 
 
-def supp_macro_at(per_class_f1, support, threshold):
-    idx = [i for i, s in enumerate(support) if s >= threshold]
+HIGH_SUPPORT_VAL_THRESHOLD = 50
+
+
+def _supp_idx_by_val(per_class_table, threshold: int) -> list[int]:
+    """Indices of classes whose val_support meets the threshold."""
+    return [i for i, e in enumerate(per_class_table)
+            if e.get("val_support", 0) >= threshold]
+
+
+def _supp_idx_by_test(support, threshold: int) -> list[int]:
+    return [i for i, s in enumerate(support) if s >= threshold]
+
+
+def _mean_at(per_class_f1, idx) -> float:
     if not idx:
         return float("nan")
-    return float(np.mean([per_class_f1[i] for i in idx]))
+    return float(np.mean([per_class_f1[i] for i in idx if i < len(per_class_f1)]))
 
 
 def render(task_name, task_report):
     print()
-    print("=" * 90)
+    print("=" * 96)
     print(f" Task: {task_name.upper()}")
-    print("=" * 90)
+    print("=" * 96)
     base = task_report.get("test_2024")
     if not base:
         print(" no test_2024 in report")
@@ -39,18 +57,23 @@ def render(task_name, task_report):
     base_pcf = base.get("per_class_f1", [])
     base_sup = base.get("support", [])
     base_macro = base.get("macro_f1", float("nan"))
-    base_supp5 = supp_macro_at(base_pcf, base_sup, 5)
-    base_supp10 = supp_macro_at(base_pcf, base_sup, 10)
 
-    rows = [("SPECTER2 only (baseline)", base_macro, base_supp5, base_supp10, 0.0)]
+    per_class_table = task_report.get("per_class_table", [])
+    hi_idx = _supp_idx_by_val(per_class_table, HIGH_SUPPORT_VAL_THRESHOLD)
+    hi_classes = [per_class_table[i]["class"] for i in hi_idx if i < len(per_class_table)]
+    n_total = len(per_class_table)
+    n_hi = len(hi_idx)
 
-    # M2: quantification appears as one row in the variants table (when
-    # USE_QUANTIFICATION_AT_TEST + QUANTIFICATION_REPORT_BOTH yielded a
-    # `test_2024_quantified` block in the eval report).
+    base_hi = _mean_at(base_pcf, hi_idx)
+    base_supp10 = _mean_at(base_pcf, _supp_idx_by_test(base_sup, 10))
+
+    rows = [("SPECTER2 only (baseline)", base_macro, base_hi, base_supp10, 0.0)]
+
+    # Variant comparison — covers all ensemble paths the eval may have produced.
     for key, label in [
-        ("test_2024_quantified", "+ Quantification (Saerens)"),
-        ("test_2024_gpt5_ensemble", "+ GPT-5 panel"),
-        ("test_2024_knn_ensemble", "+ kNN retrieval"),
+        ("test_2024_quantified", "+ M2 Quantification"),
+        ("test_2024_gpt5_ensemble", "+ Phase A GPT-5 panel"),
+        ("test_2024_knn_ensemble", "+ Phase D kNN retrieval"),
         ("test_2024_full3_ensemble", "+ GPT-5 + kNN (3-way)"),
     ]:
         r = task_report.get(key)
@@ -59,42 +82,51 @@ def render(task_name, task_report):
         pcf = r.get("per_class_f1", [])
         sup = r.get("support", [])
         macro = r.get("macro_f1", float("nan"))
-        s5 = supp_macro_at(pcf, sup, 5)
-        s10 = supp_macro_at(pcf, sup, 10)
-        gain = s10 - base_supp10 if not np.isnan(s10) and not np.isnan(base_supp10) else float("nan")
-        rows.append((label, macro, s5, s10, gain))
+        hi = _mean_at(pcf, hi_idx)
+        supp10 = _mean_at(pcf, _supp_idx_by_test(sup, 10))
+        gain = hi - base_hi if not (np.isnan(hi) or np.isnan(base_hi)) else float("nan")
+        rows.append((label, macro, hi, supp10, gain))
 
-    print(f" {'Variant':<32} {'macro_F1':>10} {'supp(n>=5)':>12} {'supp(n>=10)':>13} {'gain':>10}")
-    print(f" {'-'*32} {'-'*10} {'-'*12} {'-'*13} {'-'*10}")
-    for label, macro, s5, s10, gain in rows:
+    # Header: PRIMARY is high-support (val n >= 50)
+    print()
+    print(f" PRIMARY metric: high-support macro_F1 ({n_hi}/{n_total} classes, "
+          f"val support >= {HIGH_SUPPORT_VAL_THRESHOLD})")
+    print(f"   Included: {', '.join(hi_classes)}")
+    print()
+    print(f" {'Variant':<28} {'raw macro_F1':>13} {'★PRIMARY':>11} {'supp(n>=10)':>13} {'PRIMARY Δ':>11}")
+    print(f"   {'(noisy: low-supp)':<26} {'':>13} {'(val≥50)':>11} {'(test≥10)':>13} {'vs baseline':>11}")
+    print(f" {'-'*28} {'-'*13} {'-'*11} {'-'*13} {'-'*11}")
+    for label, macro, hi, supp10, gain in rows:
         gain_str = "  --   " if gain == 0.0 else f"{gain:+.4f}"
-        print(f" {label:<32} {macro:>10.4f} {s5:>12.4f} {s10:>13.4f} {gain_str:>10}")
+        print(f" {label:<28} {macro:>13.4f} {hi:>11.4f} {supp10:>13.4f} {gain_str:>11}")
 
-    # Per-class gain breakdown (for rare/struggling classes)
-    full3 = task_report.get("test_2024_full3_ensemble") or task_report.get("test_2024_gpt5_ensemble")
-    if full3 and full3.get("per_class_f1") and base_pcf:
-        ens_pcf = full3["per_class_f1"]
-        per_class_table = task_report.get("per_class_table", [])
+    # Per-class breakdown using the best available ensemble variant.
+    best_ens = (task_report.get("test_2024_full3_ensemble")
+                or task_report.get("test_2024_gpt5_ensemble")
+                or task_report.get("test_2024_quantified"))
+    if best_ens and best_ens.get("per_class_f1") and base_pcf:
+        ens_pcf = best_ens["per_class_f1"]
         print()
         print(" Per-class breakdown (test 2024):")
-        print(f" {'Class':<35} {'baseline_F1':>12} {'best_ens_F1':>12} {'gain':>10} {'support':>8}")
+        print(f" {'Class':<35} {'baseline_F1':>12} {'best_ens_F1':>12} {'gain':>10} "
+              f"{'val_n':>6} {'test_n':>7} {'in_primary':>11}")
         for i, entry in enumerate(per_class_table):
             cn = entry["class"]
-            n = entry.get("test_support", 0)
+            val_n = entry.get("val_support", 0)
+            test_n = entry.get("test_support", 0)
             b = base_pcf[i] if i < len(base_pcf) else float("nan")
             e = ens_pcf[i] if i < len(ens_pcf) else float("nan")
-            g = e - b if not np.isnan(b) and not np.isnan(e) else float("nan")
+            g = e - b if not (np.isnan(b) or np.isnan(e)) else float("nan")
             mark = " ★" if g > 0.05 else (" ↓" if g < -0.02 else "  ")
-            tag = " (n<10, excluded from supp)" if n < 10 else ""
-            print(f" {cn:<35} {b:>12.3f} {e:>12.3f} {g:>+10.3f} {n:>8d}{mark}{tag}")
+            in_primary = "yes" if val_n >= HIGH_SUPPORT_VAL_THRESHOLD else "—"
+            print(f" {cn:<35} {b:>12.3f} {e:>12.3f} {g:>+10.3f} "
+                  f"{val_n:>6d} {test_n:>7d} {in_primary:>11}{mark}")
 
-    # M2: quantification detail block — shows estimated test prior vs train
-    # prior per class, and the threshold delta. Useful for the drift report.
+    # M2: quantification detail block — estimated test prior + threshold shifts.
     quant = task_report.get("test_2024_quantified")
     if quant:
         print()
         print(f" M2 Quantification ({quant.get('estimator', '?')}):")
-        per_class_table = task_report.get("per_class_table", [])
         thresholds_baseline = task_report.get("thresholds") or []
         adjusted = quant.get("adjusted_thresholds") or []
         priors = quant.get("estimated_test_prior") or []
@@ -113,9 +145,14 @@ def render(task_name, task_report):
 
 
 def main():
+    global HIGH_SUPPORT_VAL_THRESHOLD
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", default="outputs/eval_report.json")
+    parser.add_argument("--val-threshold", type=int, default=HIGH_SUPPORT_VAL_THRESHOLD,
+                        help="Minimum val support for a class to count in the "
+                             "primary high-support metric (default 50)")
     args = parser.parse_args()
+    HIGH_SUPPORT_VAL_THRESHOLD = args.val_threshold
 
     report_path = Path(args.report)
     if not report_path.exists():
@@ -127,11 +164,13 @@ def main():
         report = json.load(f)
 
     print()
-    print("=" * 90)
+    print("=" * 96)
     print(" PHASE-BY-PHASE COMPARISON")
     print(f" report: {report_path}")
     print(f" backbone: {report.get('config', {}).get('specter2_base', '?')}")
-    print("=" * 90)
+    print(f" PRIMARY metric: high-support macro_F1 (val support >= {HIGH_SUPPORT_VAL_THRESHOLD})")
+    print(" RAW macro_F1 is reported but flagged as containing low-support noise.")
+    print("=" * 96)
 
     for task_name, task_report in report.get("tasks", {}).items():
         render(task_name, task_report)
