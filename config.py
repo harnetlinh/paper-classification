@@ -163,13 +163,33 @@ ASYMMETRIC_LOSS = {
     "clip": 0.05,
 }
 
-# Loss type for multi-label tasks. AsymmetricLoss handles imbalance natively
-# but its outputs are poorly calibrated (different threshold per class — in
-# practice optimal thresholds spanned 0.10-0.99). BCE with pos_weight keeps
-# outputs calibrated and lets threshold tuning settle in a saner range.
-# Default switched to "bce_pos_weight" after the AUC-best-model run regressed
-# Method test F1 vs the original AsymmetricLoss CPU baseline.
-MULTILABEL_LOSS = "bce_pos_weight"   # "asymmetric" | "bce_pos_weight"
+# Loss type for multi-label tasks (Fields, Levels).
+#
+# CHOICE (2026-05-12, NHIỆM VỤ 3 of UPGRADE_ROADMAP_v2): "asymmetric"
+#
+# AsymmetricLoss (Ridnik et al. 2021, ICCV) is designed for severely
+# imbalanced multi-label classification — it focuses the loss on hard
+# negatives via gamma_neg=4 and clips the probability of confident
+# negatives via clip=0.05. On this dataset, Fields/Levels have several
+# rare classes (Special edu, ECE, TVET, LLL, Education econ, curriculum)
+# where BCE-with-pos_weight gives diminishing returns past a certain
+# weight cap, while AsymmetricLoss continues to push the hard-negative
+# gradient.
+#
+# Tradeoff (documented in earlier code comment, still true):
+# - AsymmetricLoss outputs are LESS calibrated than BCE-pos_weight, so
+#   per-class threshold tuning has to work harder (thresholds can span
+#   0.10-0.99 instead of clustering around 0.5).
+# - MITIGATION: the support-tiered threshold tuning (NHIỆM VỤ 2) plus
+#   the precision-floor constraint blocks the failure mode where un-
+#   calibrated outputs let the F1-maximizer pick extreme thresholds.
+#
+# Rollback rule: if test 2024 high_support_macro_f1 drops < 0.55 for
+# Fields or Levels after re-train, switch back to "bce_pos_weight"
+# (instructions in UPGRADE_ROADMAP_v2 — ROLLBACK section).
+#
+# Method task is single-label and uses Focal CE — unaffected by this flag.
+MULTILABEL_LOSS = "asymmetric"   # "asymmetric" | "bce_pos_weight"
 
 # Label smoothing for BCE (only used when MULTILABEL_LOSS == "bce_pos_weight").
 # Replaces hard 0/1 targets with (smoothing/2, 1-smoothing/2). Combats the
