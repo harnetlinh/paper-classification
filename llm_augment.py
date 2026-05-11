@@ -131,10 +131,25 @@ def aggregate_special_edu_votes(votes_per_llm: List[Dict]) -> Dict:
 
 
 # ==================== Class registry ====================
+# Spec fields:
+#   task:                "fields" | "levels"
+#   binary_col:          column in gold parquet (e.g. "field_07", "level_ECE")
+#   label_value:         canonical label string used in fields_list / levels_list
+#   list_col:            "fields_list" or "levels_list"
+#   output_path:         where the augment parquet is saved
+#   keywords:            pre-filter terms (case-insensitive substring match)
+#   progress_task_name:  per-class progress file name (resume support)
+#   prompt_fn:           (title, abstract) → (system_prompt, user_prompt)
+#   response_field:      JSON key for the boolean answer in the LLM response
+#   min_votes:           how many of the 3-model panel must vote YES to include
+#                        the paper as augmented label. 3 = unanimous (strict),
+#                        2 = majority (permissive). Defaults to 3.
 def _build_specs():
     """Class-to-spec registry. Built lazily so that import order is safe."""
     sp_idx = config.FIELDS_12.index("Special education")
-    return {
+    field_idx = {f: i for i, f in enumerate(config.FIELDS_12)}
+    specs = {
+        # ===== Original 4 rare classes (UNANIMOUS — strict precision) =====
         "Special education": {
             "task": "fields",
             "binary_col": f"field_{sp_idx:02d}",
@@ -145,7 +160,8 @@ def _build_specs():
             "progress_task_name": "special_edu_augment",
             "prompt_fn": lambda title, abstract: prompts.make_special_edu_filter_prompt(title, abstract),
             "response_field": "is_special_education",
-            "gold_positive_count": None,  # populated at run time
+            "min_votes": 3,
+            "gold_positive_count": None,
         },
         "ECE": {
             "task": "levels",
@@ -157,6 +173,7 @@ def _build_specs():
             "progress_task_name": "ece_augment",
             "prompt_fn": lambda title, abstract: prompts.make_level_filter_prompt("ECE", title, abstract),
             "response_field": "is_match",
+            "min_votes": 3,
             "gold_positive_count": None,
         },
         "TVET": {
@@ -169,6 +186,7 @@ def _build_specs():
             "progress_task_name": "tvet_augment",
             "prompt_fn": lambda title, abstract: prompts.make_level_filter_prompt("TVET", title, abstract),
             "response_field": "is_match",
+            "min_votes": 3,
             "gold_positive_count": None,
         },
         "LLL": {
@@ -181,9 +199,37 @@ def _build_specs():
             "progress_task_name": "lll_augment",
             "prompt_fn": lambda title, abstract: prompts.make_level_filter_prompt("LLL", title, abstract),
             "response_field": "is_match",
+            "min_votes": 3,
             "gold_positive_count": None,
         },
     }
+
+    # ===== 4 underperforming Field classes (MAJORITY — accept noisier data) =====
+    # These had val_F1 < 0.50 in the pre-roadmap-v2 eval. The model needs MORE
+    # training samples more than perfect-precision samples, so we lower the
+    # aggregation bar from unanimous (3/3) to majority (2/3).
+    for field_name in ("test and assessment", "curriculum",
+                        "Non-STEM Education", "Education economically"):
+        progress_name = (
+            field_name.lower()
+            .replace(" ", "_").replace("&", "and").replace("-", "_")
+            + "_augment"
+        )
+        specs[field_name] = {
+            "task": "fields",
+            "binary_col": f"field_{field_idx[field_name]:02d}",
+            "label_value": field_name,
+            "list_col": "fields_list",
+            "output_path": config.FIELDS_AUGMENT_OUTPUTS[field_name],
+            "keywords": config.FIELDS_AUGMENT_KEYWORDS[field_name],
+            "progress_task_name": progress_name,
+            "prompt_fn": (lambda fn: lambda title, abstract:
+                          prompts.make_field_filter_prompt(fn, title, abstract))(field_name),
+            "response_field": "is_match",
+            "min_votes": 2,
+            "gold_positive_count": None,
+        }
+    return specs
 
 
 # ==================== Main task ====================

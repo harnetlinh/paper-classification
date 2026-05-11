@@ -383,3 +383,157 @@ def make_level_filter_prompt(level_code: str, title: str, abstract: str) -> tupl
 Is this paper primarily about {level_code} ({d['name']}) per the criteria above? Output JSON only."""
 
     return system, user
+
+
+# ==================== Fields-level filter prompts (NHIỆM VỤ 4) ====================
+# Used to augment the 4 underperforming Field classes (test_F1 < 0.50 on
+# val 2023): test and assessment, curriculum, Non-STEM Education,
+# Education economically. Each definition mirrors the codebook v2.1 spec.
+
+FIELD_AUGMENT_DEFINITIONS = {
+    "test and assessment": {
+        "name": "Test and Assessment",
+        "description": "Papers primarily about measurement methodology — "
+                       "test/scale design, validation, psychometrics.",
+        "include": [
+            "Psychometric validation of scales, tests, or instruments",
+            "IRT / Rasch analysis, factor analysis (EFA/CFA) of educational measures",
+            "Rubric design and validation",
+            "Cronbach's alpha, reliability, validity studies of educational instruments",
+            "Test development methodology, item analysis",
+            "Differential item functioning (DIF) analysis",
+            "Construct/content/criterion validity studies",
+            "Assessment methodology design (not just assessment USAGE)",
+        ],
+        "exclude": [
+            "Papers USING tests/assessments as outcome measures without studying the instrument itself",
+            "Curriculum design without an assessment component (→ curriculum)",
+            "General educational research using surveys without validating them (→ T&L)",
+            "Clinical psychometrics not in an educational context",
+        ],
+    },
+    "curriculum": {
+        "name": "Curriculum",
+        "description": "Papers primarily about curriculum design — content, "
+                       "learning outcomes, and educational activities planned.",
+        "include": [
+            "Curriculum design, development, or reform",
+            "Syllabus design, course design, module design",
+            "Competency-based education (CBE) and outcome-based education (OBE) design",
+            "Program design, curriculum mapping, curriculum alignment",
+            "Curriculum integration across subjects, cross-disciplinary curriculum",
+            "Learning outcomes design",
+            "Curriculum implementation studies (focused on the curriculum itself)",
+        ],
+        "exclude": [
+            "Teaching methods or classroom delivery (→ teaching & learning)",
+            "Administrative/policy aspects of programs (→ management, leadership & policy)",
+            "Single-lesson teaching strategies without curriculum-design focus",
+            "Curriculum evaluation that only measures student outcomes without examining design",
+        ],
+    },
+    "Non-STEM Education": {
+        "name": "Non-STEM Education",
+        "description": "Teaching/learning in arts, humanities, social sciences, "
+                       "or other non-STEM domains.",
+        "include": [
+            "Arts, music, fine arts, drama/theatre education",
+            "History, literature, philosophy education",
+            "Social studies, religious education, physical education",
+            "Business education, language teaching (non-English)",
+            "Humanities-focused curriculum or pedagogy",
+        ],
+        "exclude": [
+            "STEM subject teaching (math, science, engineering, CS) — that is STEM education",
+            "English language teaching specifically (→ English Education)",
+            "Generic education research without specifying the subject domain",
+            "Tech-in-education studies (LMS, MOOC, AI tutors) without a non-STEM subject focus",
+        ],
+    },
+    "Education economically": {
+        "name": "Education economically",
+        "description": "Education viewed from an economic perspective — ROE, "
+                       "labor outcomes, costs, equity, funding.",
+        "include": [
+            "Returns to education (ROE), wage/earnings premium from schooling",
+            "Human capital theory applied to education",
+            "Labor market outcomes of graduates, employability",
+            "Education funding, education investment, cost analysis",
+            "Education and economic growth, education and inequality, education and income",
+            "Economics of education (education economics as a discipline)",
+        ],
+        "exclude": [
+            "Teaching economics as a subject (→ curriculum + Non-STEM Education)",
+            "Education policy not framed in economic terms (→ management, leadership & policy)",
+            "Student outcomes measured non-economically (test scores, well-being)",
+            "General employability of students without economic analysis",
+        ],
+    },
+}
+
+
+def make_field_filter_prompt(field_name: str, title: str, abstract: str) -> tuple:
+    """Build (system, user) prompts for a Fields-class candidate verification.
+
+    Mirrors make_level_filter_prompt structure, parameterized by field
+    definition from FIELD_AUGMENT_DEFINITIONS. Returns 'is_match' key
+    (same response field name as make_level_filter_prompt — callers
+    coerce_bool that key).
+
+    Args:
+        field_name: must be a key in FIELD_AUGMENT_DEFINITIONS.
+        title, abstract: paper text.
+
+    Returns:
+        (system_prompt, user_prompt)
+    """
+    if field_name not in FIELD_AUGMENT_DEFINITIONS:
+        raise ValueError(
+            f"Unknown field: {field_name!r}. Choose from "
+            f"{list(FIELD_AUGMENT_DEFINITIONS)}"
+        )
+    d = FIELD_AUGMENT_DEFINITIONS[field_name]
+
+    include_block = "\n".join(f"- {item}" for item in d["include"])
+    exclude_block = "\n".join(f"- {item}" for item in d["exclude"])
+
+    system = f"""You are an expert reviewer screening educational research papers for the Field class "{field_name}" ({d['name']}).
+
+## CRITICAL INSTRUCTIONS
+1. The Abstract is the PRIMARY source of information (~190 words). Title is SECONDARY.
+2. Base your decision PRIMARILY on Abstract content. Use Title only for disambiguation.
+3. In your reasoning, cite specific text from the Abstract that justifies your decision.
+4. Be MODERATELY conservative — return true if the paper genuinely fits this class per
+   the codebook (the 20% threshold rule: topic covers >= 20% of paper content). The
+   2-of-3 majority vote aggregation downstream tolerates some noise, so don't be
+   over-strict; but don't expand the class boundary either.
+
+## {field_name} ({d['name']}) — definition
+{d['description']}
+
+## {field_name} INCLUDES:
+{include_block}
+
+## NOT {field_name}:
+{exclude_block}
+
+## OUTPUT SCHEMA (strict JSON, no prose outside JSON)
+
+{{
+  "is_match": true | false,
+  "reasoning": "<20+ words, cite text from Abstract>",
+  "confidence": "high" | "medium" | "low"
+}}
+"""
+
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+    user = f"""## TITLE
+{title}
+
+## ABSTRACT
+{abstract if abstract else "[MISSING ABSTRACT — decision based on Title only, lower confidence]"}
+
+Is this paper primarily about {field_name} ({d['name']}) per the criteria above? Output JSON only."""
+
+    return system, user

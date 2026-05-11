@@ -409,6 +409,93 @@ LEVEL_AUGMENT_OUTPUTS = {
     "LLL": OUTPUT_DIR / "lll_augmented.parquet",
 }
 
+# ==================== FIELDS-level LLM augmentation (NHIỆM VỤ 4) ====================
+# Adds 4 underperforming Field classes to the LLM augment panel. Each uses a
+# keyword-based pre-filter to reduce GPT-5 candidate cost (full-corpus scan
+# would be ~$150/class without pre-filter; pre-filter cuts to ~$10/class).
+#
+# Aggregation rule for these 4 classes: MAJORITY (2/3 of GPT-5 panel agree).
+# The original 4 classes (Special edu, ECE, TVET, LLL) use UNANIMOUS (3/3)
+# because they're rare classes where false positives are very expensive. For
+# the underperforming Fields, val F1 < 0.50 indicates the model needs MORE
+# training data more urgently than perfect-precision data, so we accept
+# slightly noisier augment via majority vote.
+FIELDS_AUGMENT_KEYWORDS = {
+    "test and assessment": [
+        # Psychometric methodology (specific, multi-word phrases to avoid FP)
+        "psychometric", "psychometrics",
+        "rasch model", "rasch analysis",
+        "item response theory", "irt model", "irt analysis",
+        "factor analysis", "exploratory factor analysis", "confirmatory factor analysis",
+        "cronbach", "cronbach's alpha",
+        "scale validation", "test validation",
+        "rubric design", "rubric validation",
+        "instrument validation", "instrument development",
+        "questionnaire validation", "questionnaire development",
+        "validity and reliability", "reliability and validity",
+        "differential item functioning",
+        "construct validity", "content validity", "criterion validity",
+        "measurement invariance",
+        "assessment design", "assessment methodology",
+        "test design", "test development",
+    ],
+    "curriculum": [
+        # Curriculum design + structure (avoid bare "curriculum" — too broad)
+        "curriculum design", "curriculum development",
+        "curriculum reform", "curriculum revision",
+        "curriculum framework", "curriculum mapping",
+        "curriculum integration", "curriculum implementation",
+        "curriculum evaluation", "curriculum alignment",
+        "competency-based education", "competency based education",
+        "outcome-based education", "outcomes based education", "obe",
+        "program design", "programme design",
+        "syllabus design", "syllabus development",
+        "course design", "module design",
+        "learning outcomes design",
+        "curriculum standards",
+    ],
+    "Non-STEM Education": [
+        # Non-STEM domain teaching (specific subjects, avoid bare "humanities")
+        "humanities education", "humanities teaching", "humanities curriculum",
+        "arts education", "arts teaching",
+        "music education", "music teaching", "music learning",
+        "fine arts education", "fine arts teaching",
+        "history education", "history teaching",
+        "literature education", "literature teaching",
+        "philosophy education", "philosophy teaching",
+        "business education", "business teaching",
+        "social studies education", "social studies teaching",
+        "physical education",
+        "religious education", "religion education",
+        "drama education", "theatre education", "theater education",
+        "art teaching", "art instruction",
+        "language teaching",  # non-English language teaching disambiguated via GPT
+    ],
+    "Education economically": [
+        # Economic perspective on education
+        "human capital",
+        "return on education", "returns to education", "return to education",
+        "wage premium", "earnings premium", "income premium",
+        "labor market outcome", "labour market outcome",
+        "labor market return", "labour market return",
+        "education funding", "education investment",
+        "education and economic", "education and growth",
+        "graduate employability", "graduate employment",
+        "education economics", "economics of education",
+        "cost of education", "education cost",
+        "education and inequality", "education and income",
+        "schooling and earnings", "schooling and wages",
+        "education premium",
+    ],
+}
+
+FIELDS_AUGMENT_OUTPUTS = {
+    "test and assessment":   OUTPUT_DIR / "test_assessment_augmented.parquet",
+    "curriculum":            OUTPUT_DIR / "curriculum_augmented.parquet",
+    "Non-STEM Education":    OUTPUT_DIR / "non_stem_augmented.parquet",
+    "Education economically": OUTPUT_DIR / "education_econ_augmented.parquet",
+}
+
 # ==================== LOSS CONFIG ====================
 # Focal cross-entropy for the single-label Method task — focuses gradient on
 # hard examples, which helps the very-rare 'Other' class (~33 train samples).
