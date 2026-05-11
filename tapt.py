@@ -44,23 +44,70 @@ warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 
 # ==================== Corpus loader ====================
-def _load_full_corpus() -> pd.DataFrame:
-    """Concatenate train + val + test abstracts (no labels) for MLM pretraining.
+# Minimum corpus size for MLM pretraining to be statistically meaningful.
+# Below this threshold, TAPT risks overfit on a tiny set. Auto-fallback to
+# the "all" mode kicks in if the requested corpus is undersized.
+TAPT_CORPUS_MIN_SIZE = 500
 
-    Including test abstracts is the explicit recommendation of Gururangan et al.
-    2020 — TAPT uses the unlabeled corpus from the SAME distribution as the
-    downstream task, which means test inputs (without their labels) are fair
-    game to adapt the encoder to the test-time vocabulary.
+
+def _load_full_corpus(corpus_mode: str | None = None) -> pd.DataFrame:
+    """Load (Title, Abstract) corpus for TAPT MLM pretraining, no labels needed.
+
+    Args:
+        corpus_mode: override config.TAPT_CORPUS. Useful for testing all three
+                     modes from a single call site.
+
+    Modes (see config.TAPT_CORPUS docstring for full rationale):
+        - "test_only" : only main_2024_clean (most direct drift addressing).
+                        Auto-falls back to "all" if < TAPT_CORPUS_MIN_SIZE.
+        - "all"       : gold 2013-2023 + main 2024 (default Gururangan recipe).
+        - "recent"    : main 2024 + last 2 train years (compromise).
+
+    Returns:
+        DataFrame with Title and Abstract columns, deduplicated by (Title, Abstract).
     """
+    if corpus_mode is None:
+        corpus_mode = getattr(config, "TAPT_CORPUS", "all")
+
     if not config.GOLD_PARQUET.exists():
         raise FileNotFoundError(f"Run sanitize.py first; missing {config.GOLD_PARQUET}")
     gold = pd.read_parquet(config.GOLD_PARQUET)
-    parts = [gold]
-    if config.MAIN_2024_PARQUET.exists():
-        test = pd.read_parquet(config.MAIN_2024_PARQUET)
-        parts.append(test)
-    df = pd.concat(parts, ignore_index=True)
+    have_test = config.MAIN_2024_PARQUET.exists()
+    test = pd.read_parquet(config.MAIN_2024_PARQUET) if have_test else None
+
+    if corpus_mode == "test_only":
+        if not have_test:
+            raise FileNotFoundError(
+                f"TAPT_CORPUS='test_only' requires {config.MAIN_2024_PARQUET}. "
+                f"Run sanitize.py first."
+            )
+        df = test[["Title", "Abstract"]].copy()
+    elif corpus_mode == "recent":
+        parts = [gold[gold["Year"] >= 2022][["Title", "Abstract"]]]
+        if have_test:
+            parts.append(test[["Title", "Abstract"]])
+        df = pd.concat(parts, ignore_index=True)
+    elif corpus_mode == "all":
+        parts = [gold[["Title", "Abstract"]]]
+        if have_test:
+            parts.append(test[["Title", "Abstract"]])
+        df = pd.concat(parts, ignore_index=True)
+    else:
+        raise ValueError(
+            f"Unknown TAPT_CORPUS mode: {corpus_mode!r}. "
+            f"Choose from 'test_only', 'all', 'recent'."
+        )
+
     df = df.drop_duplicates(subset=["Title", "Abstract"]).reset_index(drop=True)
+
+    # Guard #2: size fallback. MLM on tiny corpus risks overfit to the few
+    # examples we see — defeats the purpose of TAPT. Auto-escalate to "all"
+    # only if the original mode was "test_only" (the smallest by design).
+    if len(df) < TAPT_CORPUS_MIN_SIZE and corpus_mode == "test_only":
+        print(f"  [Guard] TAPT_CORPUS='test_only' yields only {len(df)} papers "
+              f"(< {TAPT_CORPUS_MIN_SIZE}). Auto-falling back to 'all'.")
+        return _load_full_corpus(corpus_mode="all")
+
     return df
 
 
@@ -208,7 +255,7 @@ def run_tapt(
     tokenizer.save_pretrained(str(output_dir))
     print(f"\nTAPT-adapted model saved to: {output_dir}")
     print(f"  → To use: set config.BACKBONE_MODEL = \"{output_dir}\"")
-    print(f"  → Then re-run: python train_specter2.py --task all --ensemble")
+    print("  → Then re-run: python train_specter2.py --task all --ensemble")
 
     return log
 

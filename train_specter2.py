@@ -269,10 +269,25 @@ def train_model(task: str, smoke: bool = False, seed: int = None,
         target_type = "single_label"
     
     print(f"Task type: {target_type}, n_classes: {n_classes}")
-    
+
+    # M1: load TAPT-adapted encoder if available, else fall back to HF Hub
+    # pretrained weights. TAPT_OUTPUT_DIR is produced by tapt.py and contains
+    # both the SPECTER2 encoder weights (MLM-continued) and the matching
+    # tokenizer (Guard #1) — same AutoModel API works either way.
+    encoder_path = config.BACKBONE_MODEL
+    if bool(getattr(config, "USE_TAPT", False)):
+        tapt_dir = getattr(config, "TAPT_OUTPUT_DIR", None)
+        if tapt_dir is not None and Path(tapt_dir).exists():
+            encoder_path = str(tapt_dir)
+            print(f"  Loading TAPT-adapted encoder from {encoder_path}")
+        else:
+            print(f"  WARNING: USE_TAPT=True but {tapt_dir} does not exist — "
+                  f"falling back to HF Hub backbone ({config.BACKBONE_MODEL}). "
+                  f"Run `python tapt.py` first to materialize the adapted encoder.")
+
     # Tokenizer
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(encoder_path)
     
     # Datasets
     method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
@@ -299,12 +314,16 @@ def train_model(task: str, smoke: bool = False, seed: int = None,
     )
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     
-    # Model
-    print(f"Loading SPECTER2 base model ({config.BACKBONE_MODEL})...")
+    # Model — same encoder_path as tokenizer above (TAPT-adapted when present).
+    # When encoder_path == TAPT_OUTPUT_DIR, BACKBONE_REVISION is irrelevant
+    # because the local path has no revision concept; pass None defensively.
+    is_tapt_load = encoder_path != config.BACKBONE_MODEL
+    print(f"Loading {'TAPT-adapted' if is_tapt_load else 'SPECTER2 base'} "
+          f"model ({encoder_path})...")
     model = SpecterClassifier(
-        config.BACKBONE_MODEL, n_classes=n_classes,
+        encoder_path, n_classes=n_classes,
         dropout=getattr(config, "DROPOUT", 0.1),
-        revision=getattr(config, "BACKBONE_REVISION", None),
+        revision=None if is_tapt_load else getattr(config, "BACKBONE_REVISION", None),
     ).to(device)
 
     # Print the rich-features flag prominently — eval/inference need to be run
@@ -562,8 +581,17 @@ def build_ensemble(task: str):
         n_classes = len(config.METHODS_5)
         target_type = "single_label"
 
+    # M1: same TAPT-aware encoder resolution as train_model().
+    encoder_path = config.BACKBONE_MODEL
+    if bool(getattr(config, "USE_TAPT", False)):
+        tapt_dir = getattr(config, "TAPT_OUTPUT_DIR", None)
+        if tapt_dir is not None and Path(tapt_dir).exists():
+            encoder_path = str(tapt_dir)
+            print(f"  Loading TAPT-adapted encoder from {encoder_path}")
+    is_tapt_load = encoder_path != config.BACKBONE_MODEL
+
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.BACKBONE_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(encoder_path)
     method_to_idx = {m: i for i, m in enumerate(config.METHODS_5)}
     val_ds = utils.PaperDataset(
         val_df, tokenizer, target_cols=target_cols, target_type=target_type,
@@ -582,9 +610,9 @@ def build_ensemble(task: str):
             print(f"  [skip] seed={seed} not trained: {path}")
             continue
         model = SpecterClassifier(
-            config.BACKBONE_MODEL, n_classes=n_classes,
+            encoder_path, n_classes=n_classes,
             dropout=getattr(config, "DROPOUT", 0.1),
-            revision=getattr(config, "BACKBONE_REVISION", None),
+            revision=None if is_tapt_load else getattr(config, "BACKBONE_REVISION", None),
         ).to(device)
         model.load_state_dict(torch.load(path, map_location=device))
         probs_seed, val_targets = predict_probs(model, val_loader, device, target_type)

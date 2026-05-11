@@ -241,6 +241,39 @@ QUANTIFICATION_ESTIMATOR = "saerens_em"
 # When False, only the quantified metric is reported (deployment-style).
 QUANTIFICATION_REPORT_BOTH = True
 
+# ==================== TAPT (M1 — Task-Adaptive Pretraining) ====================
+# Continue masked-LM pretraining of the SPECTER2 base on the project corpus
+# (Title + Abstract, no labels needed) to adapt the encoder to vocabulary
+# and topic drift between train years (2013-2022) and test year (2024).
+# Reference: Gururangan et al. 2020, "Don't Stop Pretraining", ACL.
+# Reference: UPGRADE_ROADMAP_v2.md §3.1.
+USE_TAPT = True
+
+# Where the TAPT-adapted encoder is saved by tapt.py and loaded from by
+# train_specter2.py / evaluate.py / inference.py. Drop-in replacement for
+# BACKBONE_MODEL — same AutoModel API, same SPECTER2 base hidden_size 768.
+TAPT_OUTPUT_DIR = OUTPUT_DIR / "specter2_tapt"
+
+# Corpus selection for TAPT MLM pretraining. The right choice depends on
+# how severe the temporal drift is:
+#   "test_only"  — only main_2024_clean (~600 papers). MOST DIRECT addressing
+#                  of the train 2013-2022 → test 2024 vocabulary/topic gap.
+#                  Recommended default. Auto-falls back to "all" if < 500 papers.
+#   "all"        — gold 2013-2023 + main 2024 (~2600 papers). More data but
+#                  largely overlaps with the fine-tune corpus, so adapts less
+#                  specifically to test-time distribution.
+#   "recent"     — main 2024 + last 2 train years (2022, 2023) (~1300 papers).
+#                  Compromise between scale and recency.
+TAPT_CORPUS = "test_only"
+
+# TAPT hyperparameters. SPECTER2 was pretrained with much larger compute;
+# we only continue MLM for a few epochs — too many epochs cause forgetting
+# of the original pretraining (catastrophic forgetting on the long tail).
+TAPT_EPOCHS = 3
+TAPT_LR = 5e-5         # standard MLM continue-pretrain rate (higher than fine-tune LR)
+TAPT_BATCH_SIZE = 16   # T4 16GB OK at this batch with seq_len 512
+TAPT_MLM_PROBABILITY = 0.15   # BERT MLM standard
+
 # ==================== LLM CONFIG (OpenAI-only ensemble) ====================
 # 3 different OpenAI models for diversity. All use temperature=0 + seed=SEED for reproducibility.
 # Pricing (April 2026):
