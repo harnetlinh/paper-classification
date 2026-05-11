@@ -13,6 +13,11 @@ CONFIG_DIR = PROJECT_ROOT / "configs"
 INPUT_FILE = DATA_DIR / "2025_11_09_-_biblio_-_du_lieu_phep_phan_tich_-_2013-2024__1_.xlsx"
 GOLD_PARQUET = OUTPUT_DIR / "gold_2013_2023.parquet"
 MAIN_2024_PARQUET = OUTPUT_DIR / "main_2024_clean.parquet"   # 2024 papers, sanitized + canonical labels
+# Hybrid corpus for inference (NHIỆM VỤ 5): gold 2015-2023 + main 2024 (labeled)
+# + main 2015-2023 NOT in gold (unlabeled). Output schema includes
+# `has_human_labels` boolean to distinguish labeled vs predict-only rows.
+INFERENCE_CORPUS_2015_2024_PARQUET = OUTPUT_DIR / "inference_corpus_2015_2024.parquet"
+PREDICTIONS_2015_2024_PARQUET = OUTPUT_DIR / "predictions_2015_2024.parquet"
 SPECIAL_EDU_AUGMENT = OUTPUT_DIR / "special_edu_augmented.parquet"
 LLM_LOG_DIR = OUTPUT_DIR / "llm_logs"
 LLM_PROGRESS_DIR = OUTPUT_DIR / "llm_progress"   # jsonl progress files for resume

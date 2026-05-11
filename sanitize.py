@@ -422,6 +422,137 @@ def process_main_2024(df_main: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ==================== Inference corpus 2015-2024 (NHIỆM VỤ 5) ====================
+# Subset cap when the unlabeled portion of main 2015-2023 is huge — Colab T4
+# RAM and inference time would suffer past ~10K. Below that we keep all.
+INFERENCE_UNLABELED_SUBSET_THRESHOLD = 10000
+INFERENCE_UNLABELED_SUBSET_SIZE = 5000
+
+
+def process_main_unlabeled_2015_2023(df_main: pd.DataFrame,
+                                      gold_titles_norm: set) -> pd.DataFrame:
+    """Extract main-sheet papers from 2015-2023 that are NOT in the gold sheet.
+
+    These papers have no human labels — they appear in the inference corpus
+    purely so we can predict on them and report distribution drift across the
+    full 2015-2024 timeframe.
+
+    Applies the same trash filters as labeled portions:
+      - Missing Title or Abstract → drop
+      - Title < MIN_TITLE_WORDS → drop
+      - Abstract < MIN_ABSTRACT_WORDS → drop
+
+    Note: NO Method or Field canonicalization (no labels to canonicalize).
+    NO Vietnam-relevance filter — the source sheet is already curated for
+    Vietnam educational research scope.
+
+    If the survivor count exceeds INFERENCE_UNLABELED_SUBSET_THRESHOLD (10K),
+    a random subset of INFERENCE_UNLABELED_SUBSET_SIZE (5K) is sampled with
+    the project seed for reproducibility. Below 10K → keep all.
+    """
+    print("\n--- Building unlabeled portion (main 2015-2023 NOT in gold) ---")
+    df = df_main.copy()
+    df["_year_int"] = pd.to_numeric(df["Year"], errors="coerce")
+    df = df[df["_year_int"].between(2015, 2023, inclusive="both")].copy()
+    print(f"Main 2015-2023 total: {len(df)}")
+
+    df["Title"] = df["Title"].apply(normalize_whitespace)
+    df["Abstract"] = df["Abstract"].apply(normalize_whitespace)
+    df = df[~df["Title"].isin(gold_titles_norm)].copy()
+    print(f"After excluding papers in gold (by normalised Title): {len(df)}")
+
+    n_before = len(df)
+    df = df[(df["Title"] != "") & (df["Abstract"] != "")].copy()
+    print(f"After Title+Abstract not-empty filter: {len(df)} "
+          f"(-{n_before - len(df)})")
+
+    n_before = len(df)
+    df["_tw"] = df["Title"].str.split().str.len()
+    df["_aw"] = df["Abstract"].str.split().str.len()
+    df = df[
+        (df["_tw"] >= config.MIN_TITLE_WORDS) &
+        (df["_aw"] >= config.MIN_ABSTRACT_WORDS)
+    ].copy()
+    print(f"After title>={config.MIN_TITLE_WORDS}w + "
+          f"abstract>={config.MIN_ABSTRACT_WORDS}w filter: {len(df)} "
+          f"(-{n_before - len(df)})")
+    df = df.drop(columns=["_tw", "_aw"])
+
+    if len(df) > INFERENCE_UNLABELED_SUBSET_THRESHOLD:
+        print(f"  > {INFERENCE_UNLABELED_SUBSET_THRESHOLD:,} → "
+              f"random subset {INFERENCE_UNLABELED_SUBSET_SIZE:,} (seed={config.SEED})")
+        df = df.sample(INFERENCE_UNLABELED_SUBSET_SIZE,
+                       random_state=config.SEED).reset_index(drop=True)
+    else:
+        print(f"  ≤ {INFERENCE_UNLABELED_SUBSET_THRESHOLD:,} → keep all")
+        df = df.reset_index(drop=True)
+
+    # Schema match: same columns as labeled portions, plus has_human_labels=False.
+    # Empty labels (we don't know them); binary indicators = False.
+    df["Total_ID"] = pd.to_numeric(df["Total_ID"], errors="coerce")
+    df["Year"] = df["_year_int"].astype(int)
+    df = df.drop(columns=["_year_int"])
+
+    # Rich features — same normalisation as labeled portions.
+    for col in RICH_FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].apply(normalize_whitespace)
+
+    df["fields_list"] = [[] for _ in range(len(df))]
+    df["levels_list"] = [[] for _ in range(len(df))]
+    df["method"] = None
+
+    base_cols = [
+        "Total_ID", "Year", "Title", "Abstract",
+        "fields_list", "levels_list", "method",
+    ] + RICH_FEATURE_COLS
+    out = df[base_cols].copy()
+
+    for f in config.FIELDS_12:
+        out[f"field_{config.FIELDS_12.index(f):02d}"] = False
+    for l in config.LEVELS_6:
+        out[f"level_{l}"] = False
+
+    print(f"\nFinal unlabeled 2015-2023 corpus: {len(out)} papers")
+    print("Per-year distribution:")
+    for y, n in out["Year"].value_counts().sort_index().items():
+        print(f"  {y}: {n}")
+    return out
+
+
+def build_inference_corpus_2015_2024(gold_processed: pd.DataFrame,
+                                       df_2024_processed: pd.DataFrame,
+                                       df_main_unlabeled: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate the 3 portions of the inference corpus + add the
+    has_human_labels flag. The 3 portions have identical schemas after
+    process_gold/process_main_2024/process_main_unlabeled_2015_2023 normalise
+    them — concat is safe.
+    """
+    gold_2015_plus = gold_processed[gold_processed["Year"] >= 2015].copy()
+    gold_2015_plus["has_human_labels"] = True
+
+    d2024 = df_2024_processed.copy()
+    d2024["has_human_labels"] = True
+
+    unl = df_main_unlabeled.copy()
+    unl["has_human_labels"] = False
+
+    combined = pd.concat([gold_2015_plus, d2024, unl], ignore_index=True)
+
+    print("\n=== Inference corpus 2015-2024 ===")
+    print(f"  Total papers: {len(combined)}")
+    print(f"    Gold 2015-2023 (labeled):       {len(gold_2015_plus)}")
+    print(f"    Main 2024 (labeled):            {len(d2024)}")
+    print(f"    Main 2015-2023 unlabeled:       {len(unl)}")
+    print("  Per-year distribution:")
+    for y, n in combined["Year"].value_counts().sort_index().items():
+        labeled_y = int(((combined["Year"] == y) & combined["has_human_labels"]).sum())
+        unlabeled_y = int(((combined["Year"] == y) & ~combined["has_human_labels"]).sum())
+        print(f"    {y}: {n}  (labeled={labeled_y}, unlabeled={unlabeled_y})")
+    return combined
+
+
 def compute_codebook_hash() -> str:
     """SHA-256 hash of FIELDS_12, LEVELS_6, METHODS_5 + aliases for audit."""
     payload = json.dumps({
@@ -457,10 +588,19 @@ def main():
     print("\n--- Processing main 2024 ---")
     out_2024 = process_main_2024(df_main)
     
-    # Save
+    # Save labeled portions
     out_gold.to_parquet(config.GOLD_PARQUET, index=False)
     out_2024.to_parquet(config.MAIN_2024_PARQUET, index=False)
-    
+
+    # NHIỆM VỤ 5: build + save inference corpus 2015-2024 (hybrid: labeled +
+    # main 2015-2023 unlabeled). Used by inference.py to predict on the full
+    # 2015-2024 corpus for the comprehensive review workbook.
+    gold_titles_norm = set(out_gold["Title"].apply(normalize_whitespace).tolist())
+    out_unlabeled = process_main_unlabeled_2015_2023(df_main, gold_titles_norm)
+    out_inference = build_inference_corpus_2015_2024(out_gold, out_2024, out_unlabeled)
+    out_inference.to_parquet(config.INFERENCE_CORPUS_2015_2024_PARQUET, index=False)
+    print(f"\nSaved inference corpus: {config.INFERENCE_CORPUS_2015_2024_PARQUET}")
+
     print("\n" + "=" * 80)
     print("OUTPUT SUMMARY")
     print("=" * 80)
