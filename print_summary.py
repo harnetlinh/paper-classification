@@ -1,13 +1,19 @@
 """
 Print a publication-ready metric summary from outputs/eval_report.json.
 
-Three metric variants are reported per task:
-- macro_f1          : standard, drags down on rare/empty classes
-- supported_macro_f1: classes with support >= 5 (research-grade reliability)
+PRIMARY METRIC (per config.PRIMARY_METRIC = "high_support_macro_f1"):
+    Mean of per-class test F1, restricted to classes whose VAL support meets
+    config.HIGH_SUPPORT_VAL_THRESHOLDS[task] (default 50/30/20 for
+    fields/levels/method). Bibliometric-paper convention — below this
+    threshold a class's F1 is noise-dominated even with perfect predictions.
+
+Secondary metrics (kept for transparency):
+- macro_f1          : standard, drags on rare/empty classes
+- supported_macro_f1: classes with test support >= 5 (research-grade reliability,
+                      computed at eval time using TEST support)
 - weighted_f1       : weighted by support, robust to empty classes
 
-Plus per-class table sorted by F1 ascending so the worst classes surface first
-(useful for prioritising manual label review of the disagreements workbook).
+Per-class table sorted by F1 ascending so the worst classes surface first.
 
 Usage:
     python print_summary.py                                    # default outputs/eval_report.json
@@ -17,6 +23,8 @@ import argparse
 import json
 import math
 from pathlib import Path
+
+import numpy as np
 
 import config
 
@@ -29,6 +37,34 @@ def _fmt(v, w=8, d=4):
             return f"{'nan':>{w}}"
         return f"{v:>{w}.{d}f}"
     return str(v)
+
+
+def _compute_high_support_macro(task_name: str, task_report: dict,
+                                 use_test_split: bool) -> tuple:
+    """Compute the high-support macro F1 for one task on one split.
+
+    Returns (f1_value, n_classes_in_metric, included_class_names).
+
+    Selection rule: class is included if val_support >= threshold[task].
+    F1 averaged is the test F1 (or val F1) of those classes.
+    """
+    threshold = config.HIGH_SUPPORT_VAL_THRESHOLDS.get(task_name, 30)
+    per_class = task_report.get("per_class_table", [])
+    if not per_class:
+        return float("nan"), 0, []
+
+    included_idx = [i for i, e in enumerate(per_class)
+                    if e.get("val_support", 0) >= threshold]
+    if not included_idx:
+        return float("nan"), 0, []
+
+    key = "test_f1" if use_test_split else "val_f1"
+    f1_values = [per_class[i].get(key) for i in included_idx]
+    f1_values = [v for v in f1_values if isinstance(v, (int, float)) and not math.isnan(v)]
+    if not f1_values:
+        return float("nan"), 0, []
+    included_names = [per_class[i]["class"] for i in included_idx]
+    return float(np.mean(f1_values)), len(included_idx), included_names
 
 
 def main():
@@ -46,86 +82,105 @@ def main():
         rep = json.load(f)
 
     print()
-    print("=" * 78)
+    print("=" * 84)
     print("PUBLICATION-READY METRIC SUMMARY")
-    print("=" * 78)
+    print("=" * 84)
     print(f"  Source: {path}")
     print(f"  Backbone: {rep.get('config', {}).get('specter2_base', 'unknown')}")
+    print(f"  PRIMARY metric: {config.PRIMARY_METRIC}")
+    print(f"  Val-support thresholds: {config.HIGH_SUPPORT_VAL_THRESHOLDS}")
     print()
 
-    # ---- Headline table ----
-    print(f"  {'task':<8} {'split':<10} | {'macro_F1':>8} {'support_F1':>11} {'weighted_F1':>12} {'AUC':>6} {'AP':>6}")
-    print(f"  {'-'*8} {'-'*10} | {'-'*8} {'-'*11} {'-'*12} {'-'*6} {'-'*6}")
+    # ---- Per-task included class lists (PRIMARY metric scope) ----
+    print("  PRIMARY metric scope (classes with val_support >= threshold):")
+    for task, r in rep.get("tasks", {}).items():
+        threshold = config.HIGH_SUPPORT_VAL_THRESHOLDS.get(task, 30)
+        _, n, names = _compute_high_support_macro(task, r, use_test_split=True)
+        n_total = len(r.get("per_class_table", []))
+        print(f"    {task:<8} (val>={threshold:>2}): {n}/{n_total} classes — {', '.join(names) if names else 'NONE'}")
+    print()
+
+    # ---- Headline table — PRIMARY first ----
+    print(f"  {'task':<8} {'split':<10} | {'★PRIMARY':>10} {'raw_macroF1':>12} {'support_F1':>11} {'weighted_F1':>12} {'AUC':>6} {'AP':>6}")
+    print(f"  {'-'*8} {'-'*10} | {'-'*10} {'-'*12} {'-'*11} {'-'*12} {'-'*6} {'-'*6}")
     for task, r in rep.get("tasks", {}).items():
         for split in ("val_2023", "test_2024"):
             if split not in r:
                 continue
             m = r[split]
+            primary, _, _ = _compute_high_support_macro(task, r, use_test_split=(split == "test_2024"))
             print(f"  {task:<8} {split:<10} | "
-                  f"{_fmt(m.get('macro_f1'), w=8, d=4)} "
+                  f"{_fmt(primary, w=10, d=4)} "
+                  f"{_fmt(m.get('macro_f1'), w=12, d=4)} "
                   f"{_fmt(m.get('supported_macro_f1'), w=11, d=4)} "
                   f"{_fmt(m.get('weighted_f1'), w=12, d=4)} "
                   f"{_fmt(m.get('macro_auc'), w=6, d=3)} "
                   f"{_fmt(m.get('macro_ap'), w=6, d=3)}")
     print()
 
-    # ---- 70% achievement check ----
-    print("  '70% target' — where is the bar already cleared?")
-    print("  " + "-" * 70)
-    threshold = 0.70
+    # ---- 70% achievement check — keyed off PRIMARY ----
+    print("  '70% target' — PRIMARY metric clearance status:")
+    print("  " + "-" * 78)
+    threshold_70 = 0.70
     for task, r in rep.get("tasks", {}).items():
         for split in ("val_2023", "test_2024"):
             if split not in r:
                 continue
-            m = r[split]
-            metrics_to_check = {
-                "macro_F1":        m.get("macro_f1", 0.0),
-                "supported_F1":    m.get("supported_macro_f1", 0.0),
-                "weighted_F1":     m.get("weighted_f1", 0.0),
-                "macro_AUC":       m.get("macro_auc", 0.0),
-                "macro_AP":        m.get("macro_ap", 0.0),
+            primary, n_cls, _ = _compute_high_support_macro(task, r, use_test_split=(split == "test_2024"))
+            status = "PASS" if isinstance(primary, float) and primary >= threshold_70 else "FAIL"
+            secondaries = {
+                "macro_F1":     r[split].get("macro_f1", 0.0),
+                "supported_F1": r[split].get("supported_macro_f1", 0.0),
+                "weighted_F1":  r[split].get("weighted_f1", 0.0),
+                "macro_AUC":    r[split].get("macro_auc", 0.0),
             }
-            achieved = [k for k, v in metrics_to_check.items()
-                        if isinstance(v, float) and v >= threshold]
-            tag = ", ".join(achieved) if achieved else "NONE"
-            print(f"  {task:<8} {split:<10} | ≥ 70% on: {tag}")
+            sec_passed = [k for k, v in secondaries.items()
+                          if isinstance(v, float) and v >= threshold_70]
+            extras = f"  (secondary >=70%: {', '.join(sec_passed)})" if sec_passed else ""
+            print(f"  {task:<8} {split:<10} | PRIMARY={primary:.4f} ({n_cls} cls) "
+                  f"{status}{extras}")
     print()
 
     # ---- Per-class drilldown (test 2024 only — the publication number) ----
     print("  PER-CLASS BREAKDOWN — test 2024, sorted F1 ascending (weakest first)")
-    print("  " + "-" * 70)
+    print("  ★ = included in PRIMARY metric (val support meets task threshold)")
+    print("  " + "-" * 78)
     for task, r in rep.get("tasks", {}).items():
         rows = r.get("per_class_table", [])
-        # Sort by test_f1 ascending (worst first)
+        threshold = config.HIGH_SUPPORT_VAL_THRESHOLDS.get(task, 30)
         rows_with_test = [row for row in rows if "test_f1" in row]
         rows_with_test.sort(key=lambda x: x.get("test_f1", 0))
         print(f"\n  {task.upper()}:")
-        print(f"  {'class':<35} {'test_F1':>8} {'AUC':>6} {'support':>8}")
+        print(f"  {'class':<35} {'test_F1':>8} {'AUC':>6} {'val_n':>6} {'test_n':>7} {'in_primary':>11}")
         for row in rows_with_test:
             cls = row["class"]
             f1 = row.get("test_f1", 0)
             auc = row.get("test_auc")
-            sup = row.get("test_support", 0)
+            val_n = row.get("val_support", 0)
+            test_n = row.get("test_support", 0)
             auc_str = f"{auc:.3f}" if isinstance(auc, float) and not math.isnan(auc) else "  nan"
-            warn = " ⚠ low support" if sup < 5 else ""
-            print(f"  {cls:<35} {f1:>8.3f} {auc_str:>6} {sup:>8}{warn}")
+            in_primary = "★ yes" if val_n >= threshold else "—"
+            warn = " ⚠ low test support" if test_n < 5 else ""
+            print(f"  {cls:<35} {f1:>8.3f} {auc_str:>6} {val_n:>6} {test_n:>7} "
+                  f"{in_primary:>11}{warn}")
 
     # ---- Drift commentary ----
     print()
-    print("=" * 78)
+    print("=" * 84)
     print("INTERPRETATION GUIDE")
-    print("=" * 78)
+    print("=" * 84)
     print("""
-  - macro_F1 is the conventional headline number. It punishes rare/empty
-    classes harshly: 1 class with support=0 in test contributes F1=0 and
-    drags macro_F1 down by 1/n_classes (≈8% for 12-class Fields).
-  - supported_macro_f1 excludes classes with test support < 5. Use this as
-    the model-quality number for a research paper — it isolates classes
-    where the metric is statistically reliable.
-  - weighted_F1 weighs each class by its support, robust to empty classes.
-    Often the cleanest single number for imbalanced datasets.
-  - macro_AUC and macro_AP are threshold-independent. They reflect the
-    model's ranking quality and survive distribution shift better.
+  PRIMARY ({primary_metric}) is the publication headline:
+    Average per-class test F1 over classes with val support >= threshold.
+    Excludes classes whose F1 is noise-dominated (val too small to reliably
+    say whether predictions are correct). Methodologically cleaner than
+    raw macro_F1 which drags on empty/near-empty classes.
+
+  SECONDARY metrics retained for transparency:
+    raw macro_F1 — standard, drags on rare/empty classes.
+    supported_F1 — classes with TEST support >= 5 (defined inside eval).
+    weighted_F1  — weighted by support, robust to empty classes.
+    AUC / AP     — threshold-independent ranking quality.
 
   Distribution shift in this dataset (gold 2013-2022 vs test 2024):
     - psychology in education : 18.0% → 0.5%   (35× drop)
@@ -134,9 +189,9 @@ def main():
     - test and assessment     : 13.4% → 35.2%  (3× rise)
     - Method 'Other'          :  2.0% → 0.0%   (annotators stopped using it)
   These reflect annotator methodology change between 2013-2023 and 2024,
-  not model deficiencies. Reporting test_2024 alone is unfair to the model;
-  reporting BOTH val_2023 (same era) AND test_2024 (drift) is honest.
-""")
+  not codebook drift (codebook_v2_1.md frozen since first commit).
+  Reporting both val_2023 (same era) AND test_2024 (drift) is honest.
+""".format(primary_metric=config.PRIMARY_METRIC))
     return 0
 
 

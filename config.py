@@ -225,7 +225,14 @@ TTA_VARIANTS = ["title_then_abstract", "abstract_then_title"]
 # observed in this project: psychology drops 18% → 0.5%, Special edu rises
 # 1% → 12.6%, etc.
 # Reference: UPGRADE_ROADMAP_v2.md §3.2.
-USE_QUANTIFICATION_AT_TEST = True
+#
+# DISABLED 2026-05-12 after Phase 1c Gate 2 verification: Saerens EM diverged
+# on rare classes with val_support < 10 (Special edu val_n=1 → garbage TPR/FPR
+# estimate → adjusted threshold near 0 or 1). Effect on test 2024 Fields
+# macro_F1: 0.461 → 0.302 (regression of -0.159). The quantification module
+# remains in quantify.py for diagnostic/research use but is not applied by
+# default in the production eval path.
+USE_QUANTIFICATION_AT_TEST = False
 
 # Estimator for the test-set prior:
 #   "pacc"        — Probabilistic Adjusted Classify and Count, closed-form,
@@ -240,6 +247,32 @@ QUANTIFICATION_ESTIMATOR = "saerens_em"
 # Lets the publication / drift report show the impact transparently.
 # When False, only the quantified metric is reported (deployment-style).
 QUANTIFICATION_REPORT_BOTH = True
+
+# ==================== Primary publication metric ====================
+# Headline number reviewers should see first. "high_support_macro_f1" is the
+# bibliometric-paper convention: average per-class test F1, restricted to
+# classes whose VAL support meets a per-task threshold (research-grade
+# statistical reliability — below ~30-50 positives a class's F1 is noise-
+# dominated even with perfect predictions).
+#
+# Using VAL support (not test) keeps class composition out of the metric
+# definition — methodologically clean (test labels are the target).
+#
+# Raw `macro_f1` is still reported as a secondary number for transparency
+# but flagged as containing low-support noise.
+PRIMARY_METRIC = "high_support_macro_f1"
+
+# Per-task val support thresholds for the high-support metric.
+# Tuned to give a meaningful number of classes per task while excluding the
+# noise-dominated tail. Effective class counts on the current data:
+#   Fields  (val>=50)  : 7/12 classes
+#   Levels  (val>=30)  : 4/6 classes (drops ECE val_n=6, TVET val_n=7)
+#   Method  (val>=20)  : 4/5 classes (drops 'Other' val_n=0)
+HIGH_SUPPORT_VAL_THRESHOLDS = {
+    "fields": 50,
+    "levels": 30,
+    "method": 20,
+}
 
 # ==================== TAPT (M1 — Task-Adaptive Pretraining) ====================
 # Continue masked-LM pretraining of the SPECTER2 base on the project corpus
