@@ -37,25 +37,67 @@ def cache_key(model: str, system_prompt: str, user_prompt: str, extra: str = "")
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+# Errors that indicate a transient mount / sync issue (Google Drive on Colab
+# is the main culprit — small-file access at scale triggers ConnectionAbortedError
+# and OSError under heavy load). We retry these instead of failing the run.
+_DRIVE_TRANSIENT_ERRORS = (ConnectionAbortedError, OSError)
+
+
+def _retry_on_transient(op_name: str, fn, *args, max_attempts: int = 4, **kwargs):
+    """Call fn(*args, **kwargs) with retry on transient filesystem errors.
+
+    Used to wrap LLM cache + progress file operations on Colab where Google
+    Drive sync produces brief connection aborts when many tiny files are
+    accessed in quick succession.
+    """
+    delay = 0.5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except _DRIVE_TRANSIENT_ERRORS as exc:
+            # FileNotFoundError is technically OSError but it usually means
+            # the parent directory was unmounted. Re-raise on final attempt.
+            if attempt == max_attempts:
+                raise
+            print(f"  [retry] {op_name} hit {type(exc).__name__}: {exc} "
+                  f"(attempt {attempt}/{max_attempts}, sleep {delay:.1f}s)")
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
+    return None  # unreachable
+
+
 def get_cache_path(model_alias: str, key: str) -> Path:
     cache_dir = config.LLM_LOG_DIR / model_alias
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Defensive mkdir each call — Drive symlinks can lose state between init
+    # and read/write on Colab.
+    _retry_on_transient(
+        "mkdir cache_dir",
+        lambda: cache_dir.mkdir(parents=True, exist_ok=True),
+    )
     return cache_dir / f"{key}.json"
 
 
 def load_cached(model_alias: str, key: str) -> Optional[dict]:
     p = get_cache_path(model_alias, key)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+
+    def _check_and_read():
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    return _retry_on_transient(f"load_cached({key})", _check_and_read)
 
 
 def save_cache(model_alias: str, key: str, response: dict) -> None:
     p = get_cache_path(model_alias, key)
-    p.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(response, ensure_ascii=False, indent=2)
+    _retry_on_transient(
+        f"save_cache({key})",
+        lambda: p.write_text(payload, encoding="utf-8"),
+    )
 
 
 def parse_json_response(text: str) -> dict:
@@ -252,7 +294,19 @@ class ProgressTracker:
     def __init__(self, task_name: str):
         self.task_name = task_name
         self.path = config.LLM_PROGRESS_DIR / f"{task_name}.jsonl"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Defensive mkdir with retry — Drive symlinks can lose state.
+        _retry_on_transient(
+            "tracker mkdir parent",
+            lambda: self.path.parent.mkdir(parents=True, exist_ok=True),
+        )
+
+    def _ensure_parent(self) -> None:
+        """Re-create parent dir before each write — defends against Drive
+        unmount/remount cycles on Colab where the dir may transiently vanish."""
+        _retry_on_transient(
+            "tracker re-mkdir parent",
+            lambda: self.path.parent.mkdir(parents=True, exist_ok=True),
+        )
     
     def load_done_ids(self) -> set:
         """Return set of IDs already processed (status='done')."""
@@ -291,13 +345,20 @@ class ProgressTracker:
         return results
     
     def append(self, paper_id, status: str, result: Optional[dict] = None) -> None:
-        """Append one record. Flushes immediately."""
+        """Append one record. Flushes immediately. Defensive against Drive
+        sync errors via parent re-mkdir + retry on transient OSError."""
         rec = {
             "id": paper_id,
             "status": status,
             "result": result,
             "ts": time.time(),
         }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False, default=_json_default) + "\n")
-            f.flush()
+        payload = json.dumps(rec, ensure_ascii=False, default=_json_default) + "\n"
+
+        def _write():
+            self._ensure_parent()   # idempotent — retried inside _retry_on_transient
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+
+        _retry_on_transient(f"append({paper_id})", _write)
